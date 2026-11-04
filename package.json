@@ -1,0 +1,17 @@
+{
+  "name": "antigravity-localization-engine",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Version-independent, fail-closed Antigravity localization installer",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "check": "node --check localization_engine.js && node --check installer.js && node --check tests/assets_validation.test.js && node --check tests/security_hardening.test.js",
+    "test": "node tests/assets_validation.test.js && node tests/security_hardening.test.js"
+  },
+  "dependencies": {
+    "@electron/asar": "4.2.1"
+  }
+}
