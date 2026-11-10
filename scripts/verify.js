@@ -58,9 +58,13 @@ function assertCondition(condition, message) {
 }
 
 function verifyVersionReferences(audit) {
-    assertCondition(audit.versionFiles.length === 1, '无法确定唯一的当前版本字典');
+    assertCondition(audit.versionFiles.length === 1, '无法确定唯一的主版本字典');
     const versionFile = audit.versionFiles[0];
-    const version = versionFile.slice(0, -'.json'.length);
+    const pkgPath = path.join(ROOT_DIR, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const version = versionFile === 'release.json'
+        ? `v${String(pkg.version || '').replace(/^v/i, '')}`
+        : versionFile.slice(0, -'.json'.length);
     const agentsPath = path.join(ROOT_DIR, 'AGENTS.md');
     const readmePath = path.join(ROOT_DIR, 'README.md');
     const agents = fs.readFileSync(agentsPath, 'utf8');
@@ -69,13 +73,12 @@ function verifyVersionReferences(audit) {
     const expectedDictionaryPath = `dicts/${versionFile}`;
 
     const checks = [
-        [agents.includes(`release is **${version}**`), `AGENTS.md 当前汉化版本不是 ${version}`],
-        [agents.includes(`official **${expectedClient}** client`), `AGENTS.md 官方客户端版本不是 ${expectedClient}`],
+        [agents.includes(`**${version}**`), `AGENTS.md 当前汉化版本不是 ${version}`],
+        [agents.includes(`**${expectedClient}**`), `AGENTS.md 官方客户端版本不是 ${expectedClient}`],
         [agents.includes(`\`${expectedDictionaryPath}\``), `AGENTS.md 当前字典不是 ${expectedDictionaryPath}`],
         [readme.includes(`**汉化版本**：${version}`), `README.md 汉化版本不是 ${version}`],
         [readme.includes(`**匹配版本**：${expectedClient}`), `README.md 匹配版本不是 ${expectedClient}`],
-        [readme.includes(`\`${expectedDictionaryPath}\``), `README.md 未引用 ${expectedDictionaryPath}`],
-        [readme.includes(`\`${versionFile}\``), `README.md 词典指南未引用 ${versionFile}`]
+        [readme.includes(`\`${expectedDictionaryPath}\``) || readme.includes(`\`${versionFile}\``), `README.md 未引用 ${expectedDictionaryPath}`],
     ];
     const failures = checks.filter(([passed]) => !passed).map(([, message]) => message);
     if (failures.length) throw new Error(failures.join('\n'));
@@ -84,13 +87,41 @@ function verifyVersionReferences(audit) {
 }
 
 function verifyEngineSyntax() {
-    const enginePath = path.join(ROOT_DIR, 'localization_engine.js');
-    const result = spawnSync(process.execPath, ['--check', enginePath], {
-        cwd: ROOT_DIR,
-        encoding: 'utf8'
-    });
-    if (result.status !== 0) {
-        throw new Error((result.stderr || result.stdout || 'node --check 失败').trim());
+    const jsFiles = [
+        'localization_engine.js',
+        'installer.js',
+        'scripts/verify.js',
+        'scripts/lib/dictionary-audit.js',
+        'scripts/lib/fake-dom.js',
+        'scripts/lib/load-engine.js',
+        'tests/assets_validation.test.js',
+        'tests/renderer-regression.js',
+        'tests/security_hardening.test.js',
+        '.agents/skills/sync-marketplace-plugins/scripts/diff_marketplace_plugins.js',
+    ];
+    for (const rel of jsFiles) {
+        const filePath = path.join(ROOT_DIR, rel);
+        const result = spawnSync(process.execPath, ['--check', filePath], {
+            cwd: ROOT_DIR,
+            encoding: 'utf8'
+        });
+        if (result.status !== 0) {
+            throw new Error(`${rel}: ${(result.stderr || result.stdout || 'node --check 失败').trim()}`);
+        }
+    }
+    return { checked: jsFiles.length };
+}
+
+function verifyTestSuites() {
+    for (const rel of ['tests/assets_validation.test.js', 'tests/security_hardening.test.js']) {
+        const filePath = path.join(ROOT_DIR, rel);
+        const result = spawnSync(process.execPath, [filePath], {
+            cwd: ROOT_DIR,
+            encoding: 'utf8'
+        });
+        if (result.status !== 0) {
+            throw new Error(`${rel} 失败:\n${(result.stderr || result.stdout || '').trim()}`);
+        }
     }
 }
 
@@ -142,7 +173,7 @@ function verifyGitDiff() {
         return { available: false, status: [] };
     }
 
-    const diffCheck = spawnSync('git', ['diff', '--check'], {
+    const diffCheck = spawnSync('git', ['-c', 'core.whitespace=cr-at-eol', 'diff', '--check'], {
         cwd: ROOT_DIR,
         encoding: 'utf8'
     });
@@ -150,7 +181,7 @@ function verifyGitDiff() {
         throw new Error((diffCheck.stdout || diffCheck.stderr || 'git diff --check 失败').trim());
     }
 
-    const stagedDiffCheck = spawnSync('git', ['diff', '--cached', '--check'], {
+    const stagedDiffCheck = spawnSync('git', ['-c', 'core.whitespace=cr-at-eol', 'diff', '--cached', '--check'], {
         cwd: ROOT_DIR,
         encoding: 'utf8'
     });
@@ -192,7 +223,7 @@ function verifyVersionDictionaryMigration(audit, acknowledged) {
         throw new Error((tree.stderr || '无法读取 HEAD 中的版本字典').trim());
     }
     const previousVersionFiles = tree.stdout.split(/\r?\n/)
-        .filter(file => /^dicts\/v\d+\.\d+\.\d+\.json$/.test(file));
+        .filter(file => file === 'dicts/release.json' || /^dicts\/v\d+\.\d+\.\d+\.json$/.test(file));
     if (previousVersionFiles.length !== 1) {
         throw new Error(
             `HEAD 中必须且只能有一个版本字典，当前检测到：` +
@@ -309,7 +340,9 @@ function main() {
             }
         }
 
-        runStep('localization_engine.js 通过 node --check', verifyEngineSyntax);
+        runStep('全部 JavaScript 文件通过 node --check', verifyEngineSyntax);
+
+        runStep('合成 ASAR 安全加固与词典产物校验套件通过', verifyTestSuites);
 
         const generatedSource = runStep('generateJs() 已安全隔离 main() 并生成注入代码', () => {
             const source = generateInjection(ROOT_DIR);

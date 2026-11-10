@@ -1,17 +1,15 @@
 {
-  "name": "antigravity-localization-engine",
-  "version": "3.0.0",
+  "name": "antigravity-hans",
+  "version": "2.30.0",
   "private": true,
-  "description": "Version-independent, fail-closed Antigravity localization installer",
+  "description": "Antigravity 桌面客户端简体中文汉化引擎",
   "type": "commonjs",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
+    "verify": "node scripts/verify.js",
     "check": "node --check localization_engine.js && node --check installer.js && node --check tests/assets_validation.test.js && node --check tests/security_hardening.test.js",
     "test": "node tests/assets_validation.test.js && node tests/security_hardening.test.js"
-  },
-  "dependencies": {
-    "@electron/asar": "4.2.1"
   }
 }

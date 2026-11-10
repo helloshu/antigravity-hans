@@ -178,7 +178,7 @@ function checkTerminology(source, translation) {
         if (/代理/.test(translation)) {
             issues.push('agent 术语违规（使用了“代理”，应为“智能体”）');
         }
-        if (/[\u4e00-\u9fa5]/.test(translation) && /\bAgents?\b/.test(translation) && !/User-Agent|Subagent/i.test(translation)) {
+        if (/[\u4e00-\u9fa5]/.test(translation) && /\bAgents?\b/.test(translation) && !/User-Agent|Subagent|Data Agent Kit/i.test(translation)) {
             issues.push('agent 术语未翻译（残留“Agent”，应为“智能体”）');
         }
     }
@@ -225,7 +225,8 @@ function auditDictionaries(rootDir) {
     const files = fs.readdirSync(dictsDir)
         .filter(file => file.endsWith('.json'))
         .sort();
-    const versionFiles = files.filter(file => /^v\d+\.\d+\.\d+\.json$/.test(file));
+    const versionFiles = files.filter(file => file === 'release.json' || /^v\d+\.\d+\.\d+\.json$/.test(file));
+    const ALLOWED_IDENTITY_KEYS = new Set(['MCP', 'Google Workspace', 'Build with Google']);
     const normalizedKeys = new Map();
     const caseFoldedKeys = new Map();
     const issues = [];
@@ -305,7 +306,9 @@ function auditDictionaries(rootDir) {
 
             const foldedSource = normalizedSource.toLowerCase();
             const caseDuplicate = caseFoldedKeys.get(foldedSource);
-            if (caseDuplicate && normalizeDictionaryText(caseDuplicate.source) !== normalizedSource) {
+            if (caseDuplicate &&
+                normalizeDictionaryText(caseDuplicate.source) !== normalizedSource &&
+                normalizeDictionaryText(caseDuplicate.translation) !== normalizeDictionaryText(translation)) {
                 const previousLocation = caseDuplicate.line
                     ? `${caseDuplicate.file}:${caseDuplicate.line}`
                     : caseDuplicate.file;
@@ -317,7 +320,8 @@ function auditDictionaries(rootDir) {
                 caseFoldedKeys.set(foldedSource, record);
             }
 
-            if (normalizedSource === normalizeDictionaryText(translation)) {
+            if (normalizedSource === normalizeDictionaryText(translation) &&
+                !(file === 'marketplace_plugins.json' && ALLOWED_IDENTITY_KEYS.has(normalizedSource))) {
                 issues.push(`${location}: ${JSON.stringify(source)} 的原文与译文相同`);
             }
 

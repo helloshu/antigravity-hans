@@ -4,28 +4,35 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const vm = require('vm');
 const childProcess = require('child_process');
 const {
     generateJs,
     SIGNATURE_START,
     SIGNATURE_END,
+    LEGACY_SIGNATURE_START = '/* --- ANTIGRAVITY CHINESE LOCALIZATION START --- */',
+    LEGACY_SIGNATURE_END = '/* --- ANTIGRAVITY CHINESE LOCALIZATION END --- */',
+    MENU_SIGNATURE_START = '/* --- ANTIGRAVITY MENU LOCALIZATIONV2 START --- */',
+    MENU_SIGNATURE_END = '/* --- ANTIGRAVITY MENU LOCALIZATIONV2 END --- */',
+    LEGACY_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY MENU LOCALIZATION START --- */',
+    LEGACY_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY MENU LOCALIZATION END --- */',
+    TRAY_SIGNATURE_START = '/* --- ANTIGRAVITY TRAY LOCALIZATIONV2 START --- */',
+    TRAY_SIGNATURE_END = '/* --- ANTIGRAVITY TRAY LOCALIZATIONV2 END --- */',
+    LEGACY_TRAY_SIGNATURE_START = '/* --- ANTIGRAVITY TRAY LOCALIZATION START --- */',
+    LEGACY_TRAY_SIGNATURE_END = '/* --- ANTIGRAVITY TRAY LOCALIZATION END --- */',
+    IPC_CONTEXT_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY IPC CONTEXT MENU LOCALIZATION START --- */',
+    IPC_CONTEXT_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY IPC CONTEXT MENU LOCALIZATION END --- */',
 } = require('./localization_engine');
 
-const LEGACY_SIGNATURE_START = '/* --- ANTIGRAVITY CHINESE LOCALIZATION START --- */';
-const LEGACY_SIGNATURE_END = '/* --- ANTIGRAVITY CHINESE LOCALIZATION END --- */';
+const ALT_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION START --- */';
+const ALT_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION END --- */';
 
-const ENGINE_VERSION = '3.0.0';
-const ASAR_PACKAGE_VERSION = '4.2.1';
+const ENGINE_VERSION = '3.1.0';
 const METADATA_FILE = 'antigravity-localization.json';
 const MANIFEST_FILE = 'app.asar.localization.json';
 const BACKUP_FOLDER = '.antigravity-localization-backups';
 const TEMP_PREFIX = 'antigravity-localization-';
-const MENU_SIGNATURE_START = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION START --- */';
-const MENU_SIGNATURE_END = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION END --- */';
-const IPC_CONTEXT_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY IPC CONTEXT MENU LOCALIZATION START --- */';
-const IPC_CONTEXT_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY IPC CONTEXT MENU LOCALIZATION END --- */';
-
-let cachedAsarCli = null;
+const ASAR_BLOCK_SIZE = 4 * 1024 * 1024;
 
 class InstallerError extends Error {
     constructor(message) {
@@ -62,92 +69,505 @@ function readJsonFile(filePath, required = false) {
 
 function hashFile(filePath) {
     const hash = crypto.createHash('sha256');
-    const fileDescriptor = fs.openSync(filePath, 'r');
+    const fd = fs.openSync(filePath, 'r');
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     try {
         let bytesRead;
         do {
-            bytesRead = fs.readSync(fileDescriptor, buffer, 0, buffer.length, null);
+            bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
             if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
         } while (bytesRead > 0);
     } finally {
-        fs.closeSync(fileDescriptor);
+        fs.closeSync(fd);
     }
     return hash.digest('hex');
 }
 
-function assertSupportedNode() {
-    const [major, minor] = process.versions.node.split('.').map(Number);
-    if (major < 22 || (major === 22 && minor < 12)) {
-        throw new InstallerError(`Node.js 版本过低: ${process.versions.node}；要求 22.12.0 或更高版本。`);
+function computeAsarIntegrity(buffer) {
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    const blocks = [];
+    for (let offset = 0; offset < buffer.length; offset += ASAR_BLOCK_SIZE) {
+        const slice = buffer.subarray(offset, Math.min(offset + ASAR_BLOCK_SIZE, buffer.length));
+        blocks.push(crypto.createHash('sha256').update(slice).digest('hex'));
+    }
+    if (blocks.length === 0) {
+        blocks.push(crypto.createHash('sha256').update(Buffer.alloc(0)).digest('hex'));
+    }
+    return {
+        algorithm: 'SHA256',
+        hash,
+        blockSize: ASAR_BLOCK_SIZE,
+        blocks,
+    };
+}
+
+function isSafeArchiveEntryName(name) {
+    return Boolean(
+        typeof name === 'string' &&
+        name.length > 0 &&
+        name !== '.' &&
+        name !== '..' &&
+        !name.includes('/') &&
+        !name.includes('\\') &&
+        !name.includes('\0') &&
+        !name.includes(':')
+    );
+}
+
+class AsarArchive {
+    static align4(n) {
+        return (n + 3) & ~3;
+    }
+
+    static readHeader(asarPath) {
+        const stat = fs.statSync(asarPath);
+        if (!stat.isFile() || stat.size < 16) {
+            throw new InstallerError(`无效的 ASAR 文件（体积过小）: ${asarPath}`);
+        }
+        const fd = fs.openSync(asarPath, 'r');
+        try {
+            const sizeBuf = Buffer.alloc(8);
+            if (fs.readSync(fd, sizeBuf, 0, 8, 0) !== 8) {
+                throw new InstallerError(`无法读取 ASAR 头部长度: ${asarPath}`);
+            }
+            const pickleSize = sizeBuf.readUInt32LE(0);
+            const headerSize = sizeBuf.readUInt32LE(4);
+            if (pickleSize !== 4 || headerSize < 8 || headerSize > 64 * 1024 * 1024 || 8 + headerSize > stat.size) {
+                throw new InstallerError(`ASAR 头部尺寸越界或格式损坏: ${asarPath}`);
+            }
+
+            const headerBuf = Buffer.alloc(headerSize);
+            if (fs.readSync(fd, headerBuf, 0, headerSize, 8) !== headerSize) {
+                throw new InstallerError(`无法完整读取 ASAR 头部内容: ${asarPath}`);
+            }
+
+            const jsonLen = headerBuf.readUInt32LE(4);
+            if (jsonLen === 0 || 8 + jsonLen > headerSize) {
+                throw new InstallerError(`ASAR JSON 元数据长度越界: ${asarPath}`);
+            }
+
+            const jsonStr = headerBuf.subarray(8, 8 + jsonLen).toString('utf8');
+            const header = JSON.parse(jsonStr);
+            if (!header || typeof header !== 'object' || !header.files || typeof header.files !== 'object') {
+                throw new InstallerError(`ASAR 头部缺少有效的 files 树: ${asarPath}`);
+            }
+            const baseOffset = 8 + headerSize;
+            return { header, baseOffset, headerSize, jsonLen, fileSize: stat.size };
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
+    static createHeaderBuffer(headerJson) {
+        const jsonBuf = Buffer.from(headerJson, 'utf8');
+        const jsonLen = jsonBuf.length;
+        const alignedJsonLen = this.align4(jsonLen);
+
+        const headerPayloadSize = 4 + alignedJsonLen;
+        const headerBuf = Buffer.alloc(4 + headerPayloadSize);
+        headerBuf.writeUInt32LE(headerPayloadSize, 0);
+        headerBuf.writeUInt32LE(jsonLen, 4);
+        jsonBuf.copy(headerBuf, 8);
+
+        const sizeBuf = Buffer.alloc(8);
+        sizeBuf.writeUInt32LE(4, 0);
+        sizeBuf.writeUInt32LE(headerBuf.length, 4);
+
+        return Buffer.concat([sizeBuf, headerBuf]);
+    }
+
+    static validate(asarPath) {
+        try {
+            if (!fs.existsSync(asarPath)) return false;
+            const { header, baseOffset, fileSize } = this.readHeader(asarPath);
+            let fileCount = 0;
+
+            const validateTree = (dirObj, depth) => {
+                if (depth > 128 || !dirObj || typeof dirObj !== 'object') return false;
+                for (const [name, entry] of Object.entries(dirObj)) {
+                    if (!isSafeArchiveEntryName(name) || !entry || typeof entry !== 'object') {
+                        return false;
+                    }
+                    if (entry.files && typeof entry.files === 'object') {
+                        if (!validateTree(entry.files, depth + 1)) return false;
+                    } else if (entry.link !== undefined) {
+                        if (typeof entry.link !== 'string' || entry.link.includes('..') || path.isAbsolute(entry.link)) {
+                            return false;
+                        }
+                    } else if (entry.unpacked) {
+                        fileCount++;
+                    } else {
+                        if (entry.offset === undefined || entry.size === undefined) return false;
+                        const offset = Number(entry.offset);
+                        const size = Number(entry.size);
+                        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size < 0) {
+                            return false;
+                        }
+                        if (baseOffset + offset + size > fileSize) {
+                            return false;
+                        }
+                        fileCount++;
+                    }
+                }
+                return true;
+            };
+
+            return validateTree(header.files, 0) && fileCount > 0;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    static list(asarPath) {
+        const { header } = this.readHeader(asarPath);
+        const result = [];
+        const walk = (dirObj, prefix) => {
+            for (const [name, entry] of Object.entries(dirObj)) {
+                if (!isSafeArchiveEntryName(name)) {
+                    throw new InstallerError(`检测到不安全的 ASAR 条目名: ${name}`);
+                }
+                const relPath = prefix ? `${prefix}/${name}` : name;
+                result.push(`/${relPath}`);
+                if (entry && entry.files && typeof entry.files === 'object') {
+                    walk(entry.files, relPath);
+                }
+            }
+        };
+        walk(header.files, '');
+        return result;
+    }
+
+    static readFile(sourceAsar, relPath, resourcesDir = null) {
+        const { header, baseOffset, fileSize } = this.readHeader(sourceAsar);
+        const parts = relPath.replace(/\\/g, '/').replace(/^\/+/, '').split('/').filter(Boolean);
+        let cur = header.files;
+        for (let i = 0; i < parts.length; i++) {
+            const p = parts[i];
+            if (!isSafeArchiveEntryName(p) || !cur || !cur[p]) return null;
+            cur = i < parts.length - 1 ? cur[p].files : cur[p];
+        }
+        if (!cur || cur.files) return null;
+        if (cur.unpacked) {
+            const candidates = [`${sourceAsar}.unpacked`];
+            if (resourcesDir) candidates.push(path.join(resourcesDir, 'app.asar.unpacked'));
+            for (const root of candidates) {
+                const unpackedPath = path.join(root, ...parts);
+                if (fs.existsSync(unpackedPath)) return fs.readFileSync(unpackedPath);
+            }
+            return null;
+        }
+        if (cur.offset === undefined || cur.size === undefined) return null;
+        const offset = Number(cur.offset);
+        const size = Number(cur.size);
+        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size < 0 || baseOffset + offset + size > fileSize) {
+            throw new InstallerError(`ASAR 文件偏移越界: ${relPath}`);
+        }
+        const fd = fs.openSync(sourceAsar, 'r');
+        try {
+            const buf = Buffer.alloc(size);
+            fs.readSync(fd, buf, 0, size, baseOffset + offset);
+            return buf;
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
+    static extract(sourceAsar, destDir, resourcesDir = null) {
+        if (!this.validate(sourceAsar)) {
+            throw new InstallerError(`ASAR 校验失败或包含不安全路径: ${sourceAsar}`);
+        }
+        const { header, baseOffset } = this.readHeader(sourceAsar);
+        fs.mkdirSync(destDir, { recursive: true });
+        const fd = fs.openSync(sourceAsar, 'r');
+        try {
+            const walk = (dirObj, relParts) => {
+                for (const [name, entry] of Object.entries(dirObj)) {
+                    if (!isSafeArchiveEntryName(name)) {
+                        throw new InstallerError(`拒绝解包不安全路径: ${name}`);
+                    }
+                    const nextParts = [...relParts, name];
+                    const targetPath = path.join(destDir, ...nextParts);
+                    if (!isPathInside(destDir, targetPath)) {
+                        throw new InstallerError(`检测到目录穿越: ${targetPath}`);
+                    }
+                    if (entry.files && typeof entry.files === 'object') {
+                        fs.mkdirSync(targetPath, { recursive: true });
+                        walk(entry.files, nextParts);
+                    } else if (entry.unpacked) {
+                        const unpackedRoots = [`${sourceAsar}.unpacked`];
+                        if (resourcesDir) unpackedRoots.push(path.join(resourcesDir, 'app.asar.unpacked'));
+                        else unpackedRoots.push(path.join(path.dirname(sourceAsar), 'app.asar.unpacked'));
+                        let copied = false;
+                        for (const root of unpackedRoots) {
+                            const srcUnpacked = path.join(root, ...nextParts);
+                            if (fs.existsSync(srcUnpacked)) {
+                                fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+                                fs.copyFileSync(srcUnpacked, targetPath);
+                                copied = true;
+                                break;
+                            }
+                        }
+                        if (!copied) {
+                            throw new InstallerError(`未找到解包目录文件: ${nextParts.join('/')}`);
+                        }
+                    } else if (entry.offset !== undefined && entry.size !== undefined) {
+                        const size = Number(entry.size);
+                        const offset = Number(entry.offset);
+                        const buf = Buffer.alloc(size);
+                        if (size > 0) {
+                            fs.readSync(fd, buf, 0, size, baseOffset + offset);
+                        }
+                        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+                        fs.writeFileSync(targetPath, buf);
+                        if (entry.executable && process.platform !== 'win32') {
+                            try { fs.chmodSync(targetPath, 0o755); } catch (_) {}
+                        }
+                    }
+                }
+            };
+            walk(header.files, []);
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
+    static pack(sourceDir, targetAsar, options = {}) {
+        const unpackDirs = (options.unpackDirs || []).map(d => d.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')).filter(Boolean);
+        const unpackFiles = (options.unpackFiles || []).map(f => f.replace(/\\/g, '/').replace(/^\/+/g, '')).filter(Boolean);
+
+        const isUnpackedPath = relPath => {
+            for (const dir of unpackDirs) {
+                if (relPath === dir || relPath.startsWith(`${dir}/`)) return true;
+            }
+            for (const file of unpackFiles) {
+                if (relPath === file) return true;
+            }
+            return false;
+        };
+
+        const header = { files: {} };
+        const packedPayloads = [];
+        let currentOffset = BigInt(0);
+        const unpackedRoot = `${targetAsar}.unpacked`;
+
+        const buildTree = (absDir, relPrefix, targetFilesObj) => {
+            const entries = fs.readdirSync(absDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+            for (const entry of entries) {
+                if (entry.isSymbolicLink()) continue;
+                const relPath = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+                const fullPath = path.join(absDir, entry.name);
+                if (entry.isDirectory()) {
+                    const dirNode = { files: {} };
+                    if (isUnpackedPath(relPath)) dirNode.unpacked = true;
+                    targetFilesObj[entry.name] = dirNode;
+                    buildTree(fullPath, relPath, dirNode.files);
+                } else if (entry.isFile()) {
+                    const stat = fs.statSync(fullPath);
+                    const buf = fs.readFileSync(fullPath);
+                    const integrity = computeAsarIntegrity(buf);
+                    if (isUnpackedPath(relPath)) {
+                        targetFilesObj[entry.name] = {
+                            size: stat.size,
+                            unpacked: true,
+                            integrity,
+                        };
+                        const destUnpacked = path.join(unpackedRoot, ...relPath.split('/'));
+                        fs.mkdirSync(path.dirname(destUnpacked), { recursive: true });
+                        fs.copyFileSync(fullPath, destUnpacked);
+                    } else {
+                        const fileNode = {
+                            size: buf.length,
+                            offset: currentOffset.toString(),
+                            integrity,
+                        };
+                        if (process.platform !== 'win32' && (stat.mode & 0o111) !== 0) {
+                            fileNode.executable = true;
+                        }
+                        targetFilesObj[entry.name] = fileNode;
+                        packedPayloads.push(buf);
+                        currentOffset += BigInt(buf.length);
+                    }
+                }
+            }
+        };
+
+        buildTree(path.resolve(sourceDir), '', header.files);
+        const headerBuf = this.createHeaderBuffer(JSON.stringify(header));
+        fs.mkdirSync(path.dirname(path.resolve(targetAsar)), { recursive: true });
+        const fd = fs.openSync(targetAsar, 'w');
+        try {
+            fs.writeSync(fd, headerBuf, 0, headerBuf.length, 0);
+            let writePos = headerBuf.length;
+            for (const buf of packedPayloads) {
+                if (buf.length > 0) {
+                    fs.writeSync(fd, buf, 0, buf.length, writePos);
+                    writePos += buf.length;
+                }
+            }
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
+    static patchArchive(sourceAsar, targetAsar, filePatches) {
+        if (!this.validate(sourceAsar)) {
+            throw new InstallerError(`源 ASAR 校验失败，拒绝修补: ${sourceAsar}`);
+        }
+        const { header, baseOffset } = this.readHeader(sourceAsar);
+        const normalizedPatches = new Map();
+
+        for (const [rawPath, content] of Object.entries(filePatches || {})) {
+            const relPath = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
+            const parts = relPath.split('/').filter(Boolean);
+            if (parts.length === 0 || !parts.every(isSafeArchiveEntryName)) {
+                throw new InstallerError(`非法补丁路径: ${rawPath}`);
+            }
+            normalizedPatches.set(parts.join('/'), content);
+
+            let cur = header.files;
+            for (let i = 0; i < parts.length - 1; i++) {
+                const part = parts[i];
+                if (!cur[part] || typeof cur[part] !== 'object') {
+                    cur[part] = { files: {} };
+                } else if (!cur[part].files) {
+                    throw new InstallerError(`补丁路径与现有文件冲突: ${relPath}`);
+                }
+                cur = cur[part].files;
+            }
+            const leaf = parts[parts.length - 1];
+            if (content === null) {
+                delete cur[leaf];
+            } else if (!cur[leaf]) {
+                const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8');
+                cur[leaf] = {
+                    size: buf.length,
+                    offset: '0',
+                    integrity: computeAsarIntegrity(buf),
+                };
+            }
+        }
+
+        const srcFd = fs.openSync(sourceAsar, 'r');
+        let destFd = null;
+        try {
+            const fileEntries = [];
+            const walk = (dir, currentPath) => {
+                for (const [name, entry] of Object.entries(dir)) {
+                    const fullPath = currentPath ? `${currentPath}/${name}` : name;
+                    if (entry.files) {
+                        walk(entry.files, fullPath);
+                    } else {
+                        fileEntries.push({ path: fullPath, entry });
+                    }
+                }
+            };
+            walk(header.files, '');
+
+            const packedFiles = fileEntries.filter(f => !f.entry.unpacked && f.entry.offset !== undefined);
+            packedFiles.sort((a, b) => {
+                const diff = Number(a.entry.offset) - Number(b.entry.offset);
+                return diff !== 0 ? diff : a.path.localeCompare(b.path);
+            });
+
+            for (const item of packedFiles) {
+                item.oldOffset = Number(item.entry.offset);
+                item.oldSize = Number(item.entry.size);
+                if (normalizedPatches.has(item.path)) {
+                    const patch = normalizedPatches.get(item.path);
+                    const patchBuf = Buffer.isBuffer(patch) ? patch : Buffer.from(String(patch), 'utf8');
+                    item.patchBuffer = patchBuf;
+                    item.entry.size = patchBuf.length;
+                    item.entry.integrity = computeAsarIntegrity(patchBuf);
+                }
+            }
+
+            let currentOffset = BigInt(0);
+            for (const item of packedFiles) {
+                item.entry.offset = currentOffset.toString();
+                currentOffset += BigInt(item.entry.size);
+            }
+
+            const newHeaderBuf = this.createHeaderBuffer(JSON.stringify(header));
+            destFd = fs.openSync(targetAsar, 'w');
+            fs.writeSync(destFd, newHeaderBuf, 0, newHeaderBuf.length, 0);
+
+            let writePos = newHeaderBuf.length;
+            const copyBufSize = 256 * 1024;
+            const copyBuf = Buffer.allocUnsafe(copyBufSize);
+
+            for (const item of packedFiles) {
+                if (item.patchBuffer) {
+                    if (item.patchBuffer.length > 0) {
+                        fs.writeSync(destFd, item.patchBuffer, 0, item.patchBuffer.length, writePos);
+                        writePos += item.patchBuffer.length;
+                    }
+                } else {
+                    let remaining = item.oldSize;
+                    let readPos = baseOffset + item.oldOffset;
+                    while (remaining > 0) {
+                        const toRead = Math.min(remaining, copyBufSize);
+                        fs.readSync(srcFd, copyBuf, 0, toRead, readPos);
+                        fs.writeSync(destFd, copyBuf, 0, toRead, writePos);
+                        readPos += toRead;
+                        writePos += toRead;
+                        remaining -= toRead;
+                    }
+                }
+            }
+        } finally {
+            fs.closeSync(srcFd);
+            if (destFd !== null) fs.closeSync(destFd);
+        }
     }
 }
 
-function resolveAsarCli() {
-    if (cachedAsarCli) return cachedAsarCli;
-    assertSupportedNode();
-
-    const nodeModulesRoot = path.join(__dirname, 'node_modules');
-    const packageRoot = path.join(__dirname, 'node_modules', '@electron', 'asar');
-    const packageJsonPath = path.join(packageRoot, 'package.json');
-    const lockPath = path.join(__dirname, 'package-lock.json');
-
-    if (!fs.existsSync(packageJsonPath) || !fs.existsSync(lockPath)) {
-        throw new InstallerError(
-            '缺少经过锁文件校验的 @electron/asar。请先以普通用户身份在汉化包目录运行：npm ci --ignore-scripts'
-        );
+function parseUnpackPattern(pattern) {
+    if (!pattern) return [];
+    const trimmed = String(pattern).trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        return trimmed.slice(1, -1).split(',').map(s => s.trim()).filter(Boolean);
     }
-
-    const packageJson = readJsonFile(packageJsonPath, true);
-    const packageLock = readJsonFile(lockPath, true);
-    const lockedPackage = packageLock.packages && packageLock.packages['node_modules/@electron/asar'];
-
-    if (packageJson.version !== ASAR_PACKAGE_VERSION ||
-        !lockedPackage ||
-        lockedPackage.version !== ASAR_PACKAGE_VERSION ||
-        !lockedPackage.integrity) {
-        throw new InstallerError(
-            `@electron/asar 版本或完整性锁不匹配；要求精确版本 ${ASAR_PACKAGE_VERSION}。请删除 node_modules 后重新运行 npm ci --ignore-scripts。`
-        );
-    }
-
-    const binEntry = typeof packageJson.bin === 'string'
-        ? packageJson.bin
-        : packageJson.bin && (packageJson.bin.asar || Object.values(packageJson.bin)[0]);
-    if (!binEntry) {
-        throw new InstallerError('@electron/asar 包未声明 CLI 入口。');
-    }
-
-    const nodeModulesRootReal = fs.realpathSync(nodeModulesRoot);
-    const packageRootReal = fs.realpathSync(packageRoot);
-    if (!isPathInside(nodeModulesRootReal, packageRootReal)) {
-        throw new InstallerError('拒绝使用指向项目 node_modules 之外的 @electron/asar 包。');
-    }
-    const cliPath = fs.realpathSync(path.resolve(packageRoot, binEntry));
-    if (!isPathInside(packageRootReal, cliPath)) {
-        throw new InstallerError('拒绝执行指向 @electron/asar 包目录之外的 CLI。');
-    }
-
-    cachedAsarCli = cliPath;
-    return cliPath;
+    return [trimmed];
 }
 
 function runAsar(args) {
-    const cliPath = resolveAsarCli();
-    const result = childProcess.spawnSync(process.execPath, [cliPath, ...args], {
-        cwd: __dirname,
-        encoding: 'utf8',
-        shell: false,
-        windowsHide: true,
-        maxBuffer: 64 * 1024 * 1024,
-    });
-
-    return {
-        success: !result.error && result.status === 0,
-        status: result.status,
-        stdout: result.stdout || '',
-        stderr: result.stderr || (result.error && result.error.message) || '',
-    };
+    try {
+        if (!Array.isArray(args) || args.length === 0) {
+            return { success: false, status: 1, stdout: '', stderr: '缺少 ASAR 子命令' };
+        }
+        const command = args[0];
+        if (command === 'list') {
+            const archivePath = args[args.length - 1];
+            const lines = AsarArchive.list(archivePath);
+            return { success: true, status: 0, stdout: lines.join('\n') + '\n', stderr: '' };
+        }
+        if (command === 'extract') {
+            const archivePath = args[1];
+            const destDir = args[2];
+            AsarArchive.extract(archivePath, destDir);
+            return { success: true, status: 0, stdout: '', stderr: '' };
+        }
+        if (command === 'pack') {
+            const unpackDirs = [];
+            const unpackFiles = [];
+            const positional = [];
+            for (let i = 1; i < args.length; i++) {
+                if (args[i] === '--unpack-dir') {
+                    unpackDirs.push(...parseUnpackPattern(args[++i]));
+                } else if (args[i] === '--unpack') {
+                    unpackFiles.push(...parseUnpackPattern(args[++i]));
+                } else {
+                    positional.push(args[i]);
+                }
+            }
+            const [sourceDir, targetAsar] = positional;
+            AsarArchive.pack(sourceDir, targetAsar, { unpackDirs, unpackFiles });
+            return { success: true, status: 0, stdout: '', stderr: '' };
+        }
+        return { success: false, status: 1, stdout: '', stderr: `不支持的 ASAR 命令: ${command}` };
+    } catch (error) {
+        return { success: false, status: 1, stdout: '', stderr: error.message };
+    }
 }
 
 function createTempRoot() {
@@ -195,167 +615,68 @@ function readTextFileBounded(filePath, maxBytes = 32 * 1024 * 1024) {
     return fs.readFileSync(filePath, 'utf8');
 }
 
-function readAsarUnpackSpec(archivePath) {
-    let fd = null;
-    try {
-        const stat = fs.statSync(archivePath);
-        if (stat.size < 16) return { hasUnpacked: false, unpackDirs: [], unpackFiles: [] };
-        fd = fs.openSync(archivePath, 'r');
-        const prefix = Buffer.alloc(16);
-        if (fs.readSync(fd, prefix, 0, 16, 0) !== 16) {
-            return { hasUnpacked: false, unpackDirs: [], unpackFiles: [] };
-        }
-        const jsonSize = prefix.readUInt32LE(12);
-        if (jsonSize === 0 || jsonSize > 64 * 1024 * 1024 || 16 + jsonSize > stat.size) {
-            return { hasUnpacked: false, unpackDirs: [], unpackFiles: [] };
-        }
-        const jsonBuf = Buffer.alloc(jsonSize);
-        if (fs.readSync(fd, jsonBuf, 0, jsonSize, 16) !== jsonSize) {
-            return { hasUnpacked: false, unpackDirs: [], unpackFiles: [] };
-        }
-        const header = JSON.parse(jsonBuf.toString('utf8'));
-        const inspectNode = (entry, relPath) => {
-            if (!entry || typeof entry !== 'object') {
-                return { allUnpacked: false, anyUnpacked: false, unpackDirs: [], unpackFiles: [] };
-            }
-            if (!entry.files || typeof entry.files !== 'object') {
-                const isUnpacked = Boolean(entry.unpacked);
-                return {
-                    allUnpacked: isUnpacked,
-                    anyUnpacked: isUnpacked,
-                    unpackDirs: [],
-                    unpackFiles: isUnpacked && relPath ? [relPath] : [],
-                };
-            }
-            const names = Object.keys(entry.files);
-            if (names.length === 0) {
-                const isUnpacked = Boolean(entry.unpacked);
-                return {
-                    allUnpacked: isUnpacked,
-                    anyUnpacked: isUnpacked,
-                    unpackDirs: isUnpacked && relPath ? [relPath] : [],
-                    unpackFiles: [],
-                };
-            }
-            let allUnpacked = true;
-            let anyUnpacked = false;
-            const unpackDirs = [];
-            const unpackFiles = [];
-            for (const name of names) {
-                if (name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) continue;
-                const childPath = relPath ? `${relPath}/${name}` : name;
-                const childRes = inspectNode(entry.files[name], childPath);
-                if (!childRes.allUnpacked) allUnpacked = false;
-                if (childRes.anyUnpacked) anyUnpacked = true;
-                unpackDirs.push(...childRes.unpackDirs);
-                unpackFiles.push(...childRes.unpackFiles);
-            }
-            if (allUnpacked && relPath) {
-                return { allUnpacked: true, anyUnpacked: true, unpackDirs: [relPath], unpackFiles: [] };
-            }
-            return { allUnpacked: false, anyUnpacked, unpackDirs, unpackFiles };
-        };
-        const rootRes = inspectNode(header, '');
-        return {
-            hasUnpacked: rootRes.anyUnpacked,
-            unpackDirs: rootRes.unpackDirs,
-            unpackFiles: rootRes.unpackFiles,
-        };
-    } catch {
-        return { hasUnpacked: false, unpackDirs: [], unpackFiles: [] };
-    } finally {
-        if (fd !== null) {
-            try { fs.closeSync(fd); } catch {}
-        }
-    }
-}
-
-function removeStagedUnpackedLinkOrCopy(targetPath) {
-    if (!targetPath) return;
-    let stat;
-    try {
-        stat = fs.lstatSync(targetPath);
-    } catch {
-        return;
-    }
-    if (stat.isSymbolicLink()) {
-        try {
-            fs.unlinkSync(targetPath);
-        } catch {
-            fs.rmdirSync(targetPath);
-        }
-    } else {
-        fs.rmSync(targetPath, { recursive: true, force: true });
-    }
-}
-
-function extractArchive(archivePath, destination, resourcesDir = null) {
-    if (fs.existsSync(destination)) {
-        throw new InstallerError(`解包目标已存在，拒绝覆盖: ${destination}`);
-    }
-    if (!validateArchive(archivePath)) {
-        throw new InstallerError(`ASAR 列表校验失败或包含不安全路径: ${archivePath}`);
-    }
-    const spec = readAsarUnpackSpec(archivePath);
-    const directUnpackedDir = `${archivePath}.unpacked`;
-    if (!spec.hasUnpacked || fs.existsSync(directUnpackedDir)) {
-        const result = runAsar(['extract', archivePath, destination]);
-        if (!result.success || !fs.existsSync(destination)) {
-            throw new InstallerError(`ASAR 解包失败: ${result.stderr || result.stdout}`);
-        }
-        return;
-    }
-
-    const sharedUnpackedDir = resourcesDir ? path.join(resourcesDir, 'app.asar.unpacked') : null;
-    if (!sharedUnpackedDir || !fs.existsSync(sharedUnpackedDir)) {
-        throw new InstallerError(`ASAR 包含解包目录引用，但未找到对应的 app.asar.unpacked: ${sharedUnpackedDir || directUnpackedDir}`);
-    }
-
-    const stagedSourceAsar = `${destination}.source.asar`;
-    const stagedSourceUnpacked = `${stagedSourceAsar}.unpacked`;
-    try {
-        fs.copyFileSync(archivePath, stagedSourceAsar);
-        try {
-            fs.symlinkSync(sharedUnpackedDir, stagedSourceUnpacked, process.platform === 'win32' ? 'junction' : 'dir');
-        } catch {
-            fs.cpSync(sharedUnpackedDir, stagedSourceUnpacked, { recursive: true });
-        }
-        const result = runAsar(['extract', stagedSourceAsar, destination]);
-        if (!result.success || !fs.existsSync(destination)) {
-            throw new InstallerError(`ASAR 解包失败: ${result.stderr || result.stdout}`);
-        }
-    } finally {
-        removeStagedUnpackedLinkOrCopy(stagedSourceUnpacked);
-        if (fs.existsSync(stagedSourceAsar)) fs.unlinkSync(stagedSourceAsar);
-    }
-}
-
 function validateArchive(archivePath) {
-    if (!fs.existsSync(archivePath) || fs.statSync(archivePath).size < 1024) return false;
-    const result = runAsar(['list', archivePath]);
-    if (!result.success || result.stdout.trim().length === 0) return false;
-    for (const listedPath of result.stdout.split(/\r?\n/)) {
-        if (!listedPath.trim()) continue;
-        const normalized = listedPath.replace(/\\/g, '/').replace(/^\/+/, '');
-        if (/^[A-Za-z]:/.test(normalized) || normalized.split('/').includes('..') || normalized.includes('\0')) {
-            return false;
-        }
-    }
-    return true;
+    return AsarArchive.validate(archivePath);
 }
 
-function detectAppInfo(extractedDir) {
-    const jsonFiles = walkFiles(
-        extractedDir,
-        filePath => ['package.json', 'product.json'].includes(path.basename(filePath).toLowerCase()),
-        50000
+function isAsarFile(targetPath) {
+    try {
+        return fs.existsSync(targetPath) && fs.statSync(targetPath).isFile();
+    } catch (_) {
+        return false;
+    }
+}
+
+function listTargetFiles(target, predicate = () => true) {
+    if (isAsarFile(target)) {
+        const { header } = AsarArchive.readHeader(target);
+        const results = [];
+        const walk = (dirObj, prefix) => {
+            for (const [name, entry] of Object.entries(dirObj)) {
+                const relPath = prefix ? `${prefix}/${name}` : name;
+                if (entry && entry.files) {
+                    walk(entry.files, relPath);
+                } else if (entry && !entry.unpacked && predicate(relPath, entry)) {
+                    results.push(relPath);
+                }
+            }
+        };
+        walk(header.files, '');
+        return results;
+    }
+    return walkFiles(target, fullPath => predicate(path.relative(target, fullPath).replace(/\\/g, '/')));
+}
+
+function readTargetTextFile(target, relPath, maxBytes = 32 * 1024 * 1024) {
+    if (isAsarFile(target)) {
+        const buf = AsarArchive.readFile(target, relPath);
+        if (!buf || buf.length > maxBytes) return null;
+        return buf.toString('utf8');
+    }
+    const fullPath = path.isAbsolute(relPath) ? relPath : path.join(target, relPath);
+    if (!fs.existsSync(fullPath)) return null;
+    return readTextFileBounded(fullPath, maxBytes);
+}
+
+function detectAppInfo(target) {
+    const jsonRelPaths = listTargetFiles(
+        target,
+        relPath => ['package.json', 'product.json'].includes(path.posix.basename(relPath).toLowerCase())
     );
     const candidates = [];
 
-    for (const jsonPath of jsonFiles) {
-        const stat = fs.statSync(jsonPath);
-        if (stat.size > 2 * 1024 * 1024) continue;
-        const data = readJsonFile(jsonPath);
+    for (const itemPath of jsonRelPaths) {
+        const relPath = isAsarFile(target) ? itemPath : path.relative(target, itemPath);
+        const normRel = relPath.replace(/\\/g, '/');
+        if (normRel.split('/').length > 4) continue;
+        const text = readTargetTextFile(target, itemPath, 2 * 1024 * 1024);
+        if (!text) continue;
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch (_) {
+            continue;
+        }
         if (!data || typeof data !== 'object') continue;
 
         const names = [
@@ -365,20 +686,18 @@ function detectAppInfo(extractedDir) {
             data.displayName,
             data.appId,
         ].filter(value => typeof value === 'string');
-        const relativePath = path.relative(extractedDir, jsonPath);
-        const depth = relativePath.split(path.sep).length;
+        const depth = normRel.split('/').length;
         const joined = names.join(' ');
-        // 产品证据必须位于包根部附近，避免把深层依赖包的名称误认为宿主产品。
         const verified = /antigravity/i.test(joined) && depth <= 3;
         let score = verified ? 100 : 0;
-        if (relativePath.toLowerCase() === 'package.json') score += 20;
-        if (relativePath.toLowerCase().endsWith(`${path.sep}product.json`)) score += 10;
+        if (normRel.toLowerCase() === 'package.json') score += 20;
+        if (normRel.toLowerCase().endsWith('/product.json') || normRel.toLowerCase() === 'product.json') score += 10;
 
         candidates.push({
             name: names[0] || 'unknown',
             version: typeof data.version === 'string' ? data.version : 'unknown',
             verified,
-            evidenceFile: relativePath,
+            evidenceFile: relPath,
             score,
         });
     }
@@ -393,21 +712,17 @@ function detectAppInfo(extractedDir) {
     };
 }
 
-function listJavaScriptFiles(extractedDir) {
-    return walkFiles(extractedDir, filePath => /\.(?:js|cjs|mjs)$/i.test(filePath));
-}
-
-function scorePreloadCandidate(extractedDir, filePath, content) {
-    const relativePath = path.relative(extractedDir, filePath).replace(/\\/g, '/').toLowerCase();
-    const baseName = path.basename(filePath).toLowerCase();
+function scorePreloadCandidate(relativePathNormalized, content) {
+    const lowerRel = relativePathNormalized.replace(/\\/g, '/').toLowerCase();
+    const baseName = path.posix.basename(lowerRel);
     let score = 0;
-    if (relativePath === 'dist/preload.js') score += 300;
+    if (lowerRel === 'dist/preload.js') score += 300;
     if (baseName === 'preload.js') score += 180;
     else if (baseName.includes('preload')) score += 100;
     if (/contextBridge/.test(content)) score += 50;
     if (/ipcRenderer/.test(content)) score += 40;
     if (/require\(["']electron["']\)|from\s+["']electron["']/.test(content)) score += 20;
-    score -= relativePath.split('/').length;
+    score -= lowerRel.split('/').length;
     return score;
 }
 
@@ -415,75 +730,69 @@ function hasPreloadEvidence(content) {
     return /contextBridge|ipcRenderer|webFrame|process\.contextIsolated|process\.once\(["']loaded["']|require\(["']electron["']\)|from\s+["']electron["']/.test(content);
 }
 
-function discoverPreload(extractedDir) {
-    const jsFiles = listJavaScriptFiles(extractedDir);
-    const namedCandidates = jsFiles.filter(filePath => path.basename(filePath).toLowerCase().includes('preload'));
+function discoverPreload(target) {
+    const isArchive = isAsarFile(target);
+    const jsFiles = listTargetFiles(target, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
+    const namedCandidates = jsFiles.filter(p => path.basename(p).toLowerCase().includes('preload'));
     const candidates = [];
     const inspected = new Set();
+
     const inspectFiles = filePaths => {
-        for (const filePath of filePaths) {
-            if (inspected.has(filePath)) continue;
-            inspected.add(filePath);
-            const content = readTextFileBounded(filePath);
+        for (const itemPath of filePaths) {
+            if (inspected.has(itemPath)) continue;
+            inspected.add(itemPath);
+            const relPath = isArchive ? itemPath : path.relative(target, itemPath).replace(/\\/g, '/');
+            const content = readTargetTextFile(target, itemPath);
             if (content === null || !hasPreloadEvidence(content)) continue;
-            const score = scorePreloadCandidate(extractedDir, filePath, content);
-            if (score > 0) candidates.push({ filePath, content, score });
+            const score = scorePreloadCandidate(relPath, content);
+            if (score > 0) {
+                candidates.push({
+                    filePath: isArchive ? relPath : itemPath,
+                    relativePath: relPath,
+                    content,
+                    score,
+                });
+            }
         }
     };
+
     inspectFiles(namedCandidates);
     if (candidates.length === 0) inspectFiles(jsFiles);
 
-    candidates.sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath));
+    candidates.sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath));
 
     if (candidates.length === 0 || candidates[0].score < 40) {
         throw new InstallerError('未能可靠定位 Electron preload 脚本；为避免破坏未知版本，安装已停止。');
     }
     if (candidates.length > 1 && candidates[0].score === candidates[1].score) {
-        const tied = candidates.filter(candidate => candidate.score === candidates[0].score)
-            .map(candidate => path.relative(extractedDir, candidate.filePath));
+        const tied = candidates.filter(c => c.score === candidates[0].score).map(c => c.relativePath);
         throw new InstallerError(`检测到多个同等可信的 preload 候选，拒绝猜测: ${tied.join(', ')}`);
     }
     return candidates[0];
 }
 
-function readLocalizationMetadata(extractedDir) {
-    return readJsonFile(path.join(extractedDir, METADATA_FILE));
+function readLocalizationMetadata(target) {
+    const text = readTargetTextFile(target, METADATA_FILE, 1024 * 1024);
+    if (!text) return null;
+    try {
+        return JSON.parse(text);
+    } catch (_) {
+        return null;
+    }
 }
 
-function archiveContainsLocalization(extractedDir) {
-    if (readLocalizationMetadata(extractedDir)) return true;
-    for (const filePath of listJavaScriptFiles(extractedDir)) {
-        const content = readTextFileBounded(filePath);
-        if (content && (content.includes(SIGNATURE_START) || content.includes(LEGACY_SIGNATURE_START))) return true;
+function archiveContainsLocalization(target) {
+    if (readLocalizationMetadata(target)) return true;
+    const jsFiles = listTargetFiles(target, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
+    const priority = jsFiles.filter(p => /preload|menu|tray|ipcHandlers/i.test(p));
+    const rest = jsFiles.filter(p => !/preload|menu|tray|ipcHandlers/i.test(p));
+    for (const itemPath of [...priority, ...rest]) {
+        const content = readTargetTextFile(target, itemPath);
+        if (content && (content.includes(SIGNATURE_START) || content.includes(LEGACY_SIGNATURE_START))) {
+            return true;
+        }
     }
     return false;
-}
-
-function cleanLocalizationBlock(content) {
-    let result = content;
-    const patterns = [
-        new RegExp(escapeRegExp(SIGNATURE_START) + '[\\s\\S]*?' + escapeRegExp(SIGNATURE_END), 'g'),
-        new RegExp(escapeRegExp(LEGACY_SIGNATURE_START) + '[\\s\\S]*?' + escapeRegExp(LEGACY_SIGNATURE_END), 'g'),
-    ];
-    for (const pattern of patterns) {
-        result = result.replace(pattern, '');
-    }
-    return result.replace(
-        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', typeof globalThis.__agTranslateContextMenuItems === 'function' ? globalThis.__agTranslateContextMenuItems(items) : items),",
-        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', items),"
-    );
-}
-
-function patchPreload(extractedDir) {
-    const candidate = discoverPreload(extractedDir);
-    let cleaned = cleanLocalizationBlock(candidate.content).trimEnd();
-    cleaned = cleaned.replace(
-        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', items),",
-        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', typeof globalThis.__agTranslateContextMenuItems === 'function' ? globalThis.__agTranslateContextMenuItems(items) : items),"
-    );
-    const generated = generateJs();
-    fs.writeFileSync(candidate.filePath, `${cleaned}\n\n${generated}\n`, 'utf8');
-    return path.relative(extractedDir, candidate.filePath);
 }
 
 function cleanMarkedBlock(content, startMarker, endMarker) {
@@ -492,6 +801,43 @@ function cleanMarkedBlock(content, startMarker, endMarker) {
         'g'
     );
     return content.replace(pattern, '');
+}
+
+function cleanLocalizationBlock(content) {
+    let result = cleanMarkedBlock(content, SIGNATURE_START, SIGNATURE_END);
+    result = cleanMarkedBlock(result, LEGACY_SIGNATURE_START, LEGACY_SIGNATURE_END);
+    return result.replace(
+        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', typeof globalThis.__agTranslateContextMenuItems === 'function' ? globalThis.__agTranslateContextMenuItems(items) : items),",
+        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', items),"
+    );
+}
+
+function compileCheckJs(source, label) {
+    try {
+        new vm.Script(source, { filename: label });
+    } catch (error) {
+        throw new InstallerError(`生成的补丁脚本语法校验失败 (${label}): ${error.message}`);
+    }
+}
+
+function buildPatchedPreloadContent(rawPreloadContent) {
+    let cleaned = cleanLocalizationBlock(rawPreloadContent).trimEnd();
+    cleaned = cleaned.replace(
+        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', items),",
+        "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', typeof globalThis.__agTranslateContextMenuItems === 'function' ? globalThis.__agTranslateContextMenuItems(items) : items),"
+    );
+    const generated = generateJs();
+    compileCheckJs(generated, 'generated-localization-injection.js');
+    const combined = `${cleaned}\n\n${generated}\n`;
+    compileCheckJs(combined, 'preload.patched.js');
+    return combined;
+}
+
+function patchPreload(extractedDir) {
+    const candidate = discoverPreload(extractedDir);
+    const patched = buildPatchedPreloadContent(candidate.content);
+    fs.writeFileSync(candidate.filePath, patched, 'utf8');
+    return path.relative(extractedDir, candidate.filePath);
 }
 
 function buildMenuTranslationBlock(menuVariable) {
@@ -503,7 +849,7 @@ function buildMenuTranslationBlock(menuVariable) {
         'Docs': '文档', 'Check for Updates': '检查更新', 'Toggle Developer Tools': '切换开发者工具',
         'Undo': '撤销', 'Redo': '重做', 'Cut': '剪切', 'Copy': '复制', 'Paste': '粘贴',
         'Select All': '全选', 'Minimize': '最小化', 'Maximize': '最大化', 'Close': '关闭',
-        'Reset Zoom': '重置缩放', 'Zoom In': '放大', 'Zoom Out': '缩小',
+        'Zoom': '缩放', 'Reset Zoom': '重置缩放', 'Zoom In': '放大', 'Zoom Out': '缩小',
         'Toggle Full Screen': '切换全屏', 'Version': '版本',
         'About Antigravity': '关于 Antigravity', 'Services': '服务',
         'Hide Antigravity': '隐藏 Antigravity', 'Hide Others': '隐藏其他',
@@ -519,6 +865,7 @@ function buildMenuTranslationBlock(menuVariable) {
             if (cleanLabel && !item.__agOrigLabel) item.__agOrigLabel = cleanLabel;
             const mnemonic = /&([a-zA-Z])/.test(label) ? '(&' + label.match(/&([a-zA-Z])/)[1] + ')' : '';
             if (__agMenuTranslations[cleanLabel]) item.label = __agMenuTranslations[cleanLabel] + mnemonic;
+            else if (__agMenuTranslations[label]) item.label = __agMenuTranslations[label];
             else if (/^Version\\s*([\\d.]+)?$/i.test(cleanLabel)) {
                 item.label = cleanLabel.replace(/^Version\\s*([\\d.]+)?$/i, (_, version) => version ? '版本 ' + version : '版本');
             }
@@ -530,24 +877,20 @@ function buildMenuTranslationBlock(menuVariable) {
 ${MENU_SIGNATURE_END}`;
 }
 
-function patchNativeMenu(extractedDir) {
+function replaceStringLiteral(content, original, translated) {
+    const pattern = new RegExp(`(["'])${escapeRegExp(original)}\\1`, 'g');
+    return content.replace(pattern, (_, quote) => `${quote}${translated}${quote}`);
+}
+
+function buildPatchedMenuContent(rawContent) {
     const setMenuPattern = /((?:[A-Za-z_$][\w$]*\.)*Menu\.setApplicationMenu\(\s*([A-Za-z_$][\w$]*)\s*\)\s*;?)/;
     const setMenuGlobalPattern = /((?:[A-Za-z_$][\w$]*\.)*Menu\.setApplicationMenu\(\s*([A-Za-z_$][\w$]*)\s*\)\s*;?)/g;
-    const candidates = [];
+    let content = cleanMarkedBlock(rawContent, MENU_SIGNATURE_START, MENU_SIGNATURE_END);
+    content = cleanMarkedBlock(content, LEGACY_MENU_SIGNATURE_START, LEGACY_MENU_SIGNATURE_END);
+    content = cleanMarkedBlock(content, ALT_MENU_SIGNATURE_START, ALT_MENU_SIGNATURE_END);
+    if (!setMenuPattern.test(content)) return null;
 
-    for (const filePath of listJavaScriptFiles(extractedDir)) {
-        let content = readTextFileBounded(filePath);
-        if (!content || (!content.includes('setApplicationMenu') && !content.includes(MENU_SIGNATURE_START))) continue;
-        content = cleanMarkedBlock(content, MENU_SIGNATURE_START, MENU_SIGNATURE_END);
-        const match = content.match(setMenuPattern);
-        if (match) candidates.push({ filePath, content, match, score: path.basename(filePath).toLowerCase() === 'menu.js' ? 20 : 0 });
-    }
-
-    candidates.sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath));
-    if (candidates.length === 0) return null;
-
-    const selected = candidates[0];
-    let patched = selected.content.replace(
+    let patched = content.replace(
         setMenuGlobalPattern,
         (fullMatch, callExpr, menuVar) => `${buildMenuTranslationBlock(menuVar)}\n${callExpr}`
     );
@@ -557,70 +900,136 @@ function patchNativeMenu(extractedDir) {
     );
     patched = replaceStringLiteral(patched, 'Connect to WSL', '连接至 WSL');
     patched = replaceStringLiteral(patched, 'Reopen Locally', '在本地重新打开');
-    fs.writeFileSync(selected.filePath, patched, 'utf8');
+    compileCheckJs(patched, 'menu.patched.js');
+    return patched;
+}
+
+function patchNativeMenu(extractedDir) {
+    const candidates = [];
+    for (const filePath of walkFiles(extractedDir, p => /\.(?:js|cjs|mjs)$/i.test(p))) {
+        const content = readTextFileBounded(filePath);
+        if (!content || (!content.includes('setApplicationMenu') && !content.includes(MENU_SIGNATURE_START) && !content.includes(ALT_MENU_SIGNATURE_START))) {
+            continue;
+        }
+        const patched = buildPatchedMenuContent(content);
+        if (patched) {
+            candidates.push({
+                filePath,
+                patched,
+                score: path.basename(filePath).toLowerCase() === 'menu.js' ? 20 : 0,
+            });
+        }
+    }
+    candidates.sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath));
+    if (candidates.length === 0) return null;
+    const selected = candidates[0];
+    fs.writeFileSync(selected.filePath, selected.patched, 'utf8');
     return path.relative(extractedDir, selected.filePath);
 }
 
-function replaceStringLiteral(content, original, translated) {
-    const pattern = new RegExp(`(["'])${escapeRegExp(original)}\\1`, 'g');
-    return content.replace(pattern, (_, quote) => `${quote}${translated}${quote}`);
-}
+function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
+    let result = cleanMarkedBlock(content, TRAY_SIGNATURE_START, TRAY_SIGNATURE_END);
+    result = cleanMarkedBlock(result, LEGACY_TRAY_SIGNATURE_START, LEGACY_TRAY_SIGNATURE_END);
+    result = cleanMarkedBlock(result, IPC_CONTEXT_MENU_SIGNATURE_START, IPC_CONTEXT_MENU_SIGNATURE_END);
 
-function patchOptionalMainProcessStrings(extractedDir) {
-    const changedFiles = [];
-    for (const filePath of listJavaScriptFiles(extractedDir)) {
-        let content = readTextFileBounded(filePath);
-        if (!content) continue;
-        const original = content;
-
-        const looksLikeTray = /No agents running|createTray\s*\(|new\s+Tray\s*\(/.test(content);
-        if (looksLikeTray) {
-            content = replaceStringLiteral(content, 'No agents running', '无运行中的智能体');
-            content = replaceStringLiteral(content, 'Open Antigravity', '打开 Antigravity');
-            content = content.replace(/`Open \$\{([^}]+)\}`/g, '`打开 ${$1}`');
-            content = replaceStringLiteral(content, 'Quit', '退出');
-            content = replaceStringLiteral(content, 'Connect to WSL', '连接至 WSL');
-            content = replaceStringLiteral(content, 'Reopen Locally', '在本地重新打开');
-            content = content.replace(
-                /countItem\.label\s*=\s*\([\s\S]*?' running';/g,
-                "countItem.label = count > 0 ? `${count} 个智能体运行中` : '无运行中的智能体';"
-            );
+    const looksLikeTray = /No agents running|createTray\s*\(|new\s+Tray\s*\(/.test(result);
+    if (looksLikeTray) {
+        const createTrayMatch = result.match(/function\s+createTray\s*\(\s*actions(?:\s*,\s*onClick)?\s*\)\s*\{/);
+        if (createTrayMatch) {
+            const matchedFuncHeader = createTrayMatch[0];
+            const replacementCreate = `${matchedFuncHeader}
+    ${TRAY_SIGNATURE_START}
+    const __agTrayTranslations = {
+        'No agents running': '无运行中的智能体',
+        'Open Antigravity': '打开 Antigravity',
+        'Quit': '退出',
+        'Connect to WSL': '连接至 WSL',
+        'Reopen Locally': '在本地重新打开'
+    };
+    if (Array.isArray(actions)) {
+        for (const item of actions) {
+            if (item && __agTrayTranslations[item.label]) {
+                item.label = __agTrayTranslations[item.label];
+            }
+        }
+    }
+    ${TRAY_SIGNATURE_END}`;
+            result = result.replace(matchedFuncHeader, replacementCreate);
         }
 
-        if (content.includes('createProvisionSplash')) {
-            content = content.replace(
-                '<div>Setting up WSL: ${escapeHtml(distro)}</div>',
-                '<div>正在配置 WSL：${escapeHtml(distro)}</div>'
-            );
+        const targetInsert = 'function insertTrayMenuItem(position, options) {';
+        if (result.includes(targetInsert)) {
+            const replacementInsert = `function insertTrayMenuItem(position, options) {
+    ${TRAY_SIGNATURE_START}
+    const __agAsyncTrayTranslations = {
+        'Connect to WSL': '连接至 WSL',
+        'Reopen Locally': '在本地重新打开'
+    };
+    if (options && __agAsyncTrayTranslations[options.label]) {
+        options.label = __agAsyncTrayTranslations[options.label];
+    }
+    ${TRAY_SIGNATURE_END}`;
+            result = result.replace(targetInsert, replacementInsert);
         }
 
-        const looksLikeUpdater = content.includes('Check for Updates') && content.includes('No updates available');
-        if (looksLikeUpdater) {
-            content = replaceStringLiteral(content, 'Check for Updates', '检查更新');
-            content = replaceStringLiteral(content, 'No updates available', '暂无可用更新');
-            content = replaceStringLiteral(content, 'OK', '确定');
-        }
-        content = content.replace(
-            '<div class="text">Loading Antigravity</div>',
-            '<div class="text">Antigravity 正在启动...</div>'
+        result = replaceStringLiteral(result, 'No agents running', '无运行中的智能体');
+        result = replaceStringLiteral(result, 'Open Antigravity', '打开 Antigravity');
+        result = result.replace(/`Open \$\{([^}]+)\}`/g, '`打开 ${$1}`');
+        result = replaceStringLiteral(result, 'Quit', '退出');
+        result = replaceStringLiteral(result, 'Connect to WSL', '连接至 WSL');
+        result = replaceStringLiteral(result, 'Reopen Locally', '在本地重新打开');
+        result = result.replace(
+            /countItem\.label\s*=\s*\([\s\S]*?' running';/g,
+            "countItem.label = count > 0 ? `${count} 个智能体运行中` : '无运行中的智能体';"
         );
+    }
 
-        const looksLikeWizardHtml = content.includes('Welcome to the new Antigravity!') || content.includes('Explore the new Antigravity');
-        if (looksLikeWizardHtml) {
-            content = content
-                .replace('<title>Welcome to Antigravity</title>', '<title>欢迎使用 Antigravity</title>')
-                .replace('<div class="text" style="font-size: 13px; opacity: 0.6; letter-spacing: 0.03em;">Setting up…</div>', '<div class="text" style="font-size: 13px; opacity: 0.6; letter-spacing: 0.03em;">正在设置…</div>')
-                .replace('<h1>Welcome to the new Antigravity!</h1>', '<h1>欢迎使用全新 Antigravity！</h1>')
-                .replace("<p>Antigravity has been redesigned to put agents first with new capabilities. If you'd still like a code editor, you can download it as a separate app named <b>Antigravity IDE</b>.</p>", '<p>Antigravity 经过重新设计，以智能体为核心并带来全新能力。如果您仍希望使用代码编辑器，可将其作为名为 <b>Antigravity IDE</b> 的独立应用下载</p>')
-                .replace('<span>Download the Antigravity IDE</span>', '<span>下载 Antigravity IDE</span>')
-                .replace('<button class="btn-primary" id="btn-skip">Explore the new Antigravity</button>', '<button class="btn-primary" id="btn-skip">探索全新 Antigravity</button>');
-        }
+    if (result.includes('createProvisionSplash') || result.includes('Setting up WSL:')) {
+        result = result.replace(
+            '<div>Setting up WSL: ${escapeHtml(distro)}</div>',
+            '<div>正在设置 WSL：${escapeHtml(distro)}</div>'
+        );
+    }
 
-        const contextMenuMatch = content.match(/function\s+buildContextMenuTemplate\s*\(\s*items\s*,\s*onSelect\s*\)\s*\{/);
-        if (contextMenuMatch) {
-            content = cleanMarkedBlock(content, IPC_CONTEXT_MENU_SIGNATURE_START, IPC_CONTEXT_MENU_SIGNATURE_END);
-            const matchedHeader = contextMenuMatch[0];
-            const replacementHeader = `${matchedHeader}
+    if (result.includes('Downloading the Antigravity binary')) {
+        result = result
+            .replace("onStatus?.('Downloading the Antigravity binary\\u2026');", "onStatus?.('正在下载 Antigravity 二进制文件\\u2026');")
+            .replace("onStatus?.(`Installing into ${distro}\\u2026`);", "onStatus?.(`正在安装至 ${distro}\\u2026`);");
+    }
+
+    if (result.includes('WSL setup failed')) {
+        result = result
+            .replace("await electron_1.dialog.showErrorBox('WSL setup failed', msg);", "await electron_1.dialog.showErrorBox('WSL 设置失败', msg);")
+            .replace('`Failed to install the server into WSL distro "${WSL_DISTRO}":\\n${err.message}`', '`未能将服务端安装至 WSL 分发版 "${WSL_DISTRO}"：\\n${err.message}`');
+    }
+
+    const looksLikeUpdater = result.includes('Check for Updates') && result.includes('No updates available');
+    if (looksLikeUpdater) {
+        result = replaceStringLiteral(result, 'Check for Updates', '检查更新');
+        result = replaceStringLiteral(result, 'No updates available', '暂无可用更新');
+        result = replaceStringLiteral(result, 'OK', '确定');
+    }
+
+    result = result.replace(
+        '<div class="text">Loading Antigravity</div>',
+        '<div class="text">Antigravity 正在启动...</div>'
+    );
+
+    const looksLikeWizardHtml = result.includes('Welcome to the new Antigravity!') || result.includes('Explore the new Antigravity');
+    if (looksLikeWizardHtml) {
+        result = result
+            .replace('<title>Welcome to Antigravity</title>', '<title>欢迎使用 Antigravity</title>')
+            .replace('<div class="text" style="font-size: 13px; opacity: 0.6; letter-spacing: 0.03em;">Setting up…</div>', '<div class="text" style="font-size: 13px; opacity: 0.6; letter-spacing: 0.03em;">正在设置…</div>')
+            .replace('<h1>Welcome to the new Antigravity!</h1>', '<h1>欢迎使用全新 Antigravity！</h1>')
+            .replace("<p>Antigravity has been redesigned to put agents first with new capabilities. If you'd still like a code editor, you can download it as a separate app named <b>Antigravity IDE</b>.</p>", '<p>Antigravity 经过重新设计，以智能体为核心并带来全新能力。如果您仍希望使用代码编辑器，可将其作为名为 <b>Antigravity IDE</b> 的独立应用下载</p>')
+            .replace('<span>Download the Antigravity IDE</span>', '<span>下载 Antigravity IDE</span>')
+            .replace('<button class="btn-primary" id="btn-skip">Explore the new Antigravity</button>', '<button class="btn-primary" id="btn-skip">探索全新 Antigravity</button>');
+    }
+
+    const contextMenuMatch = result.match(/function\s+buildContextMenuTemplate\s*\(\s*items\s*,\s*onSelect\s*\)\s*\{/);
+    if (contextMenuMatch) {
+        const matchedHeader = contextMenuMatch[0];
+        const replacementHeader = `${matchedHeader}
     ${IPC_CONTEXT_MENU_SIGNATURE_START}
     const contextMenuTranslations = {
         "Rename": "重命名",
@@ -633,6 +1042,7 @@ function patchOptionalMainProcessStrings(extractedDir) {
         "Split": "拆分",
         "Archive": "归档",
         "Delete": "删除",
+        "Stop": "停止",
         "Pin": "置顶",
         "Unpin": "取消置顶",
         "Conversation Name": "会话名称",
@@ -656,12 +1066,14 @@ function patchOptionalMainProcessStrings(extractedDir) {
         "Remove From Split": "从拆分中移除",
         "Copy File Path": "复制文件路径",
         "Copy File Name": "复制文件名称",
+        "Comment": "评论",
+        "Quote": "引用",
         "Add to Chat": "添加到聊天",
+        "Add to Chat/Quote": "添加到聊天/引用",
         "Copy Image": "复制图片",
         "Save Image": "保存图片",
         "Copy Video": "复制视频",
         "Save Video": "保存视频",
-        "Stop": "停止",
         "Close Tab": "关闭标签页",
         "Close Other Tabs": "关闭其他标签页",
         "Close Tabs to the Right": "关闭右侧标签页",
@@ -671,32 +1083,100 @@ function patchOptionalMainProcessStrings(extractedDir) {
         "Open in External Browser": "在外部浏览器中打开",
         "Open in Built-in Browser": "在内置浏览器中打开",
         "Open in Browser": "在浏览器中打开",
+        "Open in": "打开方式",
+        "Open In": "打开方式",
+        "Built-in Browser (Default)": "内置浏览器 (默认)",
+        "External Browser": "外部浏览器",
+        "Settings": "设置",
+        "Copy Message": "复制消息",
+        "Undo to Here": "撤销至此处",
         "Copy Link": "复制链接",
-        "Reopen Closed Tab": "重新打开已关闭的标签页",
-        "Move Conversation Up": "上移会话",
-        "Move Conversation Down": "下移会话",
-        "Background Commands": "后台命令"
+        "Reopen Closed Tab": "重新打开关闭的标签页",
+        "Move Conversation Up": "向上移动会话",
+        "Move Conversation Down": "向下移动会话",
+        "Background Commands": "后台命令",
+        "Background Tasks": "后台任务"
     };
-    if (Array.isArray(items)) {
-        items = items.map((item) => {
+    function translateIpcContextMenuItems(menuItems) {
+        if (!Array.isArray(menuItems)) return menuItems;
+        return menuItems.map((item) => {
             if (!item || typeof item !== 'object') return item;
             const itemId = String(item.id || '');
             if (/^group-(?!new$|remove$)/i.test(itemId)) return item;
             const rawLabel = typeof item.label === 'string' ? item.label.trim() : '';
             const translatedLabel = rawLabel && contextMenuTranslations[rawLabel] ? contextMenuTranslations[rawLabel] : item.label;
-            return translatedLabel !== item.label ? Object.assign({}, item, { label: translatedLabel }) : item;
+            let next = translatedLabel !== item.label ? Object.assign({}, item, { label: translatedLabel }) : item;
+            if (Array.isArray(next.submenu)) {
+                next = Object.assign({}, next, { submenu: translateIpcContextMenuItems(next.submenu) });
+            }
+            if (Array.isArray(next.items)) {
+                next = Object.assign({}, next, { items: translateIpcContextMenuItems(next.items) });
+            }
+            return next;
         });
     }
+    if (Array.isArray(items)) {
+        items = translateIpcContextMenuItems(items);
+    }
     ${IPC_CONTEXT_MENU_SIGNATURE_END}`;
-            content = content.replace(matchedHeader, replacementHeader);
-        }
+        result = result.replace(matchedHeader, replacementHeader);
+    }
 
-        if (content !== original) {
-            fs.writeFileSync(filePath, content, 'utf8');
-            changedFiles.push(path.relative(extractedDir, filePath));
+    if (result !== content) {
+        compileCheckJs(result, relPath);
+    }
+    return result;
+}
+
+function buildArchivePatches(baseArchive) {
+    const filePatches = {};
+    const preloadCandidate = discoverPreload(baseArchive);
+    filePatches[preloadCandidate.relativePath] = buildPatchedPreloadContent(preloadCandidate.content);
+
+    const jsRelPaths = listTargetFiles(baseArchive, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
+    let menuPath = null;
+    const menuCandidates = [];
+
+    for (const relPath of jsRelPaths) {
+        if (relPath === preloadCandidate.relativePath) continue;
+        const content = readTargetTextFile(baseArchive, relPath);
+        if (!content) continue;
+        if (content.includes('setApplicationMenu') || content.includes(MENU_SIGNATURE_START) || content.includes(ALT_MENU_SIGNATURE_START)) {
+            const patchedMenu = buildPatchedMenuContent(content);
+            if (patchedMenu) {
+                menuCandidates.push({
+                    relPath,
+                    patchedMenu,
+                    score: path.posix.basename(relPath).toLowerCase() === 'menu.js' ? 20 : 0,
+                });
+            }
         }
     }
-    return changedFiles;
+
+    menuCandidates.sort((a, b) => b.score - a.score || a.relPath.localeCompare(b.relPath));
+    if (menuCandidates.length > 0) {
+        menuPath = menuCandidates[0].relPath;
+        filePatches[menuPath] = menuCandidates[0].patchedMenu;
+    }
+
+    const optionalFiles = [];
+    for (const relPath of jsRelPaths) {
+        if (relPath === preloadCandidate.relativePath) continue;
+        const sourceContent = filePatches[relPath] || readTargetTextFile(baseArchive, relPath);
+        if (!sourceContent) continue;
+        const patchedContent = applyOptionalMainProcessPatch(sourceContent, relPath);
+        if (patchedContent !== sourceContent) {
+            filePatches[relPath] = patchedContent;
+            if (relPath !== menuPath) optionalFiles.push(relPath);
+        }
+    }
+
+    return {
+        filePatches,
+        preloadPath: preloadCandidate.relativePath,
+        menuPath,
+        optionalFiles,
+    };
 }
 
 function getManifestPath(resourcesDir) {
@@ -771,20 +1251,19 @@ function findManagedBackup(resourcesDir, metadata, manifest) {
     return null;
 }
 
-function prepareBaseArchive(resourcesDir, currentArchive, tempRoot) {
-    const inspectDir = path.join(tempRoot, 'inspect-current');
-    extractArchive(currentArchive, inspectDir, resourcesDir);
-    const currentMetadata = readLocalizationMetadata(inspectDir);
-    const currentIsLocalized = archiveContainsLocalization(inspectDir);
+function prepareBaseArchive(resourcesDir, currentArchive) {
+    if (!validateArchive(currentArchive)) {
+        throw new InstallerError(`当前 app.asar 结构校验失败: ${currentArchive}`);
+    }
+    const currentMetadata = readLocalizationMetadata(currentArchive);
+    const currentIsLocalized = archiveContainsLocalization(currentArchive);
     const currentHash = hashFile(currentArchive);
 
     if (!currentIsLocalized) {
         return {
             baseArchive: currentArchive,
             baseHash: currentHash,
-            extractedDir: inspectDir,
             migratedLegacyBackup: false,
-            unpackSpec: readAsarUnpackSpec(currentArchive),
         };
     }
 
@@ -804,25 +1283,18 @@ function prepareBaseArchive(resourcesDir, currentArchive, tempRoot) {
     if (!validateArchive(backupPath)) {
         throw new InstallerError(`备份不是有效的 ASAR 包: ${backupPath}`);
     }
-
-    const baseDir = path.join(tempRoot, 'base-from-backup');
-    extractArchive(backupPath, baseDir, resourcesDir);
-    if (archiveContainsLocalization(baseDir)) {
+    if (archiveContainsLocalization(backupPath)) {
         throw new InstallerError('候选备份本身含有汉化标记，不能视为官方原版。');
     }
 
     return {
         baseArchive: backupPath,
         baseHash: backupHash,
-        extractedDir: baseDir,
         migratedLegacyBackup: path.basename(backupPath).toLowerCase() === 'app.asar.bak',
-        unpackSpec: readAsarUnpackSpec(backupPath),
     };
 }
 
 function fsyncFile(filePath) {
-    // Windows 的 FlushFileBuffers 需要可写句柄；文件已经由本进程生成，因此
-    // 这里使用 r+，不会改变文件内容。
     const descriptor = fs.openSync(filePath, 'r+');
     try {
         fs.fsyncSync(descriptor);
@@ -837,42 +1309,16 @@ function atomicReplaceArchive(stagedArchive, targetArchive, expectedHash) {
     const stagedHash = hashFile(stagedArchive);
     if (stagedHash !== expectedHash) throw new InstallerError('暂存 app.asar 哈希校验失败。');
     fsyncFile(stagedArchive);
-
-    // stagedArchive 与 targetArchive 位于同一目录/卷。Node 在 Windows 使用
-    // MOVEFILE_REPLACE_EXISTING，在 POSIX 使用 rename(2)，因此这是单步替换：
-    // 失败时旧文件仍在，成功时不会出现 app.asar 暂时缺失的窗口。
     fs.renameSync(stagedArchive, targetArchive);
 }
 
-function createStagedArchive(resourcesDir, extractedDir, unpackSpec = null) {
+function createStagedArchive(resourcesDir, extractedDir) {
     const nonce = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
     const stagedArchive = path.join(resourcesDir, `app.asar.localized-${nonce}.tmp`);
-    const stagedUnpacked = `${stagedArchive}.unpacked`;
-    const packArgs = ['pack'];
-    if (unpackSpec && unpackSpec.hasUnpacked && fs.existsSync(path.join(resourcesDir, 'app.asar.unpacked'))) {
-        if (unpackSpec.unpackDirs.length === 1) {
-            packArgs.push('--unpack-dir', unpackSpec.unpackDirs[0]);
-        } else if (unpackSpec.unpackDirs.length > 1) {
-            packArgs.push('--unpack-dir', `{${unpackSpec.unpackDirs.join(',')}}`);
-        }
-        if (unpackSpec.unpackFiles.length === 1) {
-            packArgs.push('--unpack', unpackSpec.unpackFiles[0]);
-        } else if (unpackSpec.unpackFiles.length > 1) {
-            packArgs.push('--unpack', `{${unpackSpec.unpackFiles.join(',')}}`);
-        }
-    }
-    packArgs.push(extractedDir, stagedArchive);
-    let packResult;
-    try {
-        packResult = runAsar(packArgs);
-    } finally {
-        if (fs.existsSync(stagedUnpacked)) {
-            fs.rmSync(stagedUnpacked, { recursive: true, force: true });
-        }
-    }
-    if (!packResult.success || !validateArchive(stagedArchive)) {
+    AsarArchive.pack(extractedDir, stagedArchive);
+    if (!validateArchive(stagedArchive)) {
         if (fs.existsSync(stagedArchive)) fs.unlinkSync(stagedArchive);
-        throw new InstallerError(`ASAR 打包或验证失败: ${packResult.stderr || packResult.stdout}`);
+        throw new InstallerError('ASAR 打包或验证失败。');
     }
     return stagedArchive;
 }
@@ -882,14 +1328,12 @@ function installLocalization(resourcesDir, options = {}) {
     if (!fs.existsSync(currentArchive)) {
         throw new InstallerError(`未找到 app.asar: ${currentArchive}`);
     }
-    resolveAsarCli();
 
-    const tempRoot = createTempRoot();
     let stagedArchive = null;
     try {
         console.log('[检查] 正在识别当前客户端结构与官方基线...');
-        const base = prepareBaseArchive(resourcesDir, currentArchive, tempRoot);
-        const appInfo = detectAppInfo(base.extractedDir);
+        const base = prepareBaseArchive(resourcesDir, currentArchive);
+        const appInfo = detectAppInfo(base.baseArchive);
         if (!appInfo.verified && !options.allowUnverifiedProduct) {
             throw new InstallerError(
                 `无法从 ${appInfo.evidenceFile || 'ASAR 元数据'} 确认这是 Antigravity。` +
@@ -899,10 +1343,8 @@ function installLocalization(resourcesDir, options = {}) {
 
         console.log(`[识别] 产品: ${appInfo.name}; 版本: ${appInfo.version}; 依据: ${appInfo.evidenceFile || '未知'}`);
         const backup = ensureVersionedBackup(resourcesDir, base.baseArchive, base.baseHash);
+        const { filePatches, preloadPath, menuPath, optionalFiles } = buildArchivePatches(base.baseArchive);
 
-        const preloadPath = patchPreload(base.extractedDir);
-        const menuPath = patchNativeMenu(base.extractedDir);
-        const optionalFiles = patchOptionalMainProcessStrings(base.extractedDir);
         const metadata = {
             schemaVersion: 1,
             engineVersion: ENGINE_VERSION,
@@ -913,17 +1355,19 @@ function installLocalization(resourcesDir, options = {}) {
             backupFile: backup.backupRelativePath,
             preloadFile: preloadPath.replace(/\\/g, '/'),
         };
-        fs.writeFileSync(
-            path.join(base.extractedDir, METADATA_FILE),
-            JSON.stringify(metadata, null, 2) + '\n',
-            'utf8'
-        );
+        filePatches[METADATA_FILE] = JSON.stringify(metadata, null, 2) + '\n';
 
         console.log(`[修改] preload: ${preloadPath}`);
         if (menuPath) console.log(`[修改] 原生菜单: ${menuPath}`);
         if (optionalFiles.length > 0) console.log(`[修改] 其他主进程界面文件: ${optionalFiles.length} 个`);
 
-        stagedArchive = createStagedArchive(resourcesDir, base.extractedDir, base.unpackSpec);
+        const nonce = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
+        stagedArchive = path.join(resourcesDir, `app.asar.localized-${nonce}.tmp`);
+        AsarArchive.patchArchive(base.baseArchive, stagedArchive, filePatches);
+        if (!validateArchive(stagedArchive)) {
+            throw new InstallerError('修补后的 ASAR 包未能通过完整性校验。');
+        }
+
         const localizedHash = hashFile(stagedArchive);
         atomicReplaceArchive(stagedArchive, currentArchive, localizedHash);
         stagedArchive = null;
@@ -946,11 +1390,14 @@ function installLocalization(resourcesDir, options = {}) {
             console.warn(`[警告] 客户端已安全替换，但外部清单写入失败；包内元数据仍可用于还原: ${error.message}`);
         }
 
-        console.log(`[完成] 已部署版本无关汉化引擎；官方基线 SHA-256: ${base.baseHash}`);
+        if (process.platform === 'darwin') {
+            resignAppOnMac(resourcesDir);
+        }
+
+        console.log(`[完成] 已部署汉化引擎；官方基线 SHA-256: ${base.baseHash}`);
         return { appInfo, baseHash: base.baseHash, localizedHash, backupPath: backup.backupPath };
     } finally {
         if (stagedArchive && fs.existsSync(stagedArchive)) fs.unlinkSync(stagedArchive);
-        safeRemoveTempRoot(tempRoot);
     }
 }
 
@@ -959,15 +1406,14 @@ function restoreLocalization(resourcesDir) {
     if (!fs.existsSync(currentArchive)) {
         throw new InstallerError(`未找到 app.asar: ${currentArchive}`);
     }
-    resolveAsarCli();
+    if (!validateArchive(currentArchive)) {
+        throw new InstallerError(`当前 app.asar 结构无效: ${currentArchive}`);
+    }
 
-    const tempRoot = createTempRoot();
     let stagedArchive = null;
     try {
-        const inspectDir = path.join(tempRoot, 'inspect-restore');
-        extractArchive(currentArchive, inspectDir, resourcesDir);
-        const metadata = readLocalizationMetadata(inspectDir);
-        const isLocalized = archiveContainsLocalization(inspectDir);
+        const metadata = readLocalizationMetadata(currentArchive);
+        const isLocalized = archiveContainsLocalization(currentArchive);
         if (!isLocalized) {
             console.log('[提示] 当前 app.asar 不含本工具的汉化标记，无需还原；不会使用陈旧备份覆盖它。');
             return { alreadyOfficial: true };
@@ -987,10 +1433,7 @@ function restoreLocalization(resourcesDir) {
         if (!validateArchive(backupPath)) {
             throw new InstallerError('官方备份不是有效的 ASAR 包。');
         }
-
-        const verifyDir = path.join(tempRoot, 'verify-backup');
-        extractArchive(backupPath, verifyDir, resourcesDir);
-        if (archiveContainsLocalization(verifyDir)) {
+        if (archiveContainsLocalization(backupPath)) {
             throw new InstallerError('官方备份包含汉化标记，拒绝还原。');
         }
 
@@ -1004,7 +1447,7 @@ function restoreLocalization(resourcesDir) {
         atomicReplaceArchive(stagedArchive, currentArchive, backupHash);
         stagedArchive = null;
 
-        const restoredInfo = detectAppInfo(verifyDir);
+        const restoredInfo = detectAppInfo(currentArchive);
         try {
             writeJsonWithRollback(getManifestPath(resourcesDir), {
                 schemaVersion: 1,
@@ -1020,11 +1463,14 @@ function restoreLocalization(resourcesDir) {
             console.warn(`[警告] 官方包已还原，但状态清单更新失败: ${error.message}`);
         }
 
+        if (process.platform === 'darwin') {
+            resignAppOnMac(resourcesDir);
+        }
+
         console.log(`[完成] 已按 SHA-256 校验还原官方包: ${backupHash}`);
         return { restoredHash: backupHash, backupPath };
     } finally {
         if (stagedArchive && fs.existsSync(stagedArchive)) fs.unlinkSync(stagedArchive);
-        safeRemoveTempRoot(tempRoot);
     }
 }
 
@@ -1051,6 +1497,52 @@ function trustedUnixTool(fileName) {
     return null;
 }
 
+function findMacAppBundle(resourcesDir) {
+    if (!resourcesDir) return null;
+    let current = path.resolve(resourcesDir);
+    while (current && current !== path.dirname(current)) {
+        if (current.toLowerCase().endsWith('.app') && fs.existsSync(current)) {
+            return current;
+        }
+        current = path.dirname(current);
+    }
+    return null;
+}
+
+function resignAppOnMac(resourcesDir) {
+    if (process.platform !== 'darwin') return true;
+    let targetApp = findMacAppBundle(resourcesDir);
+    if (!targetApp) return true;
+    try { targetApp = fs.realpathSync(targetApp); } catch (_) {}
+
+    const xattr = trustedUnixTool('xattr');
+    if (xattr) {
+        runTool(xattr, ['-cr', targetApp]);
+    }
+    const codesign = trustedUnixTool('codesign');
+    if (!codesign) return true;
+
+    const frameworksDir = path.join(targetApp, 'Contents', 'Frameworks');
+    if (fs.existsSync(frameworksDir)) {
+        try {
+            for (const entry of fs.readdirSync(frameworksDir)) {
+                const fullPath = path.join(frameworksDir, entry);
+                if (entry.endsWith('.framework') || entry.endsWith('.app')) {
+                    runTool(codesign, ['--force', '--deep', '--sign', '-', fullPath]);
+                } else if (entry.endsWith('.dylib')) {
+                    runTool(codesign, ['--force', '--sign', '-', fullPath]);
+                }
+            }
+        } catch (_) {}
+    }
+
+    const res = runTool(codesign, ['--force', '--deep', '--sign', '-', targetApp]);
+    if (res.status !== 0) {
+        throw new InstallerError(`macOS 应用自签名失败: ${res.stderr || res.stdout}`);
+    }
+    return true;
+}
+
 function checkIfAppIsRunning() {
     try {
         if (process.platform === 'win32') {
@@ -1072,8 +1564,8 @@ function sleep(milliseconds) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-function forceCloseAntigravity() {
-    console.warn('[强制关闭] 用户已显式启用 --force-kill，正在结束 Antigravity 进程。');
+function closeRunningAntigravity() {
+    console.log('[等待] 检测到 Antigravity 正在运行，正在关闭客户端进程...');
     if (process.platform === 'win32') {
         const taskkill = trustedWindowsTool('taskkill.exe');
         if (!taskkill) throw new InstallerError('未找到可信的 Windows taskkill.exe。');
@@ -1081,17 +1573,27 @@ function forceCloseAntigravity() {
     } else {
         const pkill = trustedUnixTool('pkill');
         if (!pkill) throw new InstallerError('未找到可信的系统 pkill。');
-        runTool(pkill, ['-x', '-i', 'antigravity'], { stdio: 'ignore' });
+        runTool(pkill, ['-TERM', '-x', '-i', 'antigravity'], { stdio: 'ignore' });
+        for (let i = 0; i < 20 && checkIfAppIsRunning(); i++) {
+            sleep(250);
+        }
+        if (checkIfAppIsRunning()) {
+            runTool(pkill, ['-x', '-i', 'antigravity'], { stdio: 'ignore' });
+        }
     }
-    sleep(1200);
+    sleep(1000);
     if (checkIfAppIsRunning()) {
-        throw new InstallerError('强制关闭后仍检测到 Antigravity 进程，拒绝修改正在使用的文件。');
+        throw new InstallerError('关闭后仍检测到 Antigravity 进程，已停止修改以保护运行中的客户端。');
     }
 }
 
-function detectInstallationDir(manualDir) {
+function detectInstallationDir(manualDir, options = {}) {
+    const quiet = Boolean(options.quiet);
     if (manualDir) {
-        if (!fs.existsSync(manualDir)) throw new InstallerError(`指定路径不存在: ${manualDir}`);
+        if (!fs.existsSync(manualDir)) {
+            if (quiet) return null;
+            throw new InstallerError(`指定路径不存在: ${manualDir}`);
+        }
         let resolved = path.resolve(manualDir);
         if (fs.statSync(resolved).isFile() && path.basename(resolved).toLowerCase() === 'app.asar') {
             resolved = path.dirname(resolved);
@@ -1142,25 +1644,55 @@ function detectInstallationDir(manualDir) {
             add(`${drive}:\\Antigravity`);
         }
         add('C:\\Program Files\\Antigravity');
-        if (process.env.LOCALAPPDATA) add(path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity'));
+        add('C:\\Program Files (x86)\\Antigravity');
+        if (process.env.LOCALAPPDATA) {
+            add(path.join(process.env.LOCALAPPDATA, 'Programs', 'Antigravity'));
+            add(path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity'));
+            add(path.join(process.env.LOCALAPPDATA, 'Antigravity'));
+            add(path.join(process.env.LOCALAPPDATA, 'antigravity'));
+        }
+    } else if (process.platform === 'darwin') {
+        add('/Applications/Antigravity.app');
+        if (process.env.HOME) add(path.join(process.env.HOME, 'Applications', 'Antigravity.app'));
+        if (process.env.SUDO_USER && process.env.SUDO_USER !== 'root' && /^[A-Za-z0-9._-]+$/.test(process.env.SUDO_USER)) {
+            add(path.join('/Users', process.env.SUDO_USER, 'Applications', 'Antigravity.app'));
+        }
     } else {
-        const homeDir = process.env.HOME || '';
+        const homeDirs = [];
+        if (process.env.HOME) homeDirs.push(process.env.HOME);
+        if (process.env.SUDO_USER && process.env.SUDO_USER !== 'root' && /^[A-Za-z0-9._-]+$/.test(process.env.SUDO_USER)) {
+            const getent = trustedUnixTool('getent');
+            if (getent) {
+                const res = runTool(getent, ['passwd', process.env.SUDO_USER]);
+                if (res.status === 0 && res.stdout) {
+                    const parts = res.stdout.trim().split(':');
+                    if (parts.length >= 6 && parts[5]) homeDirs.push(parts[5]);
+                }
+            }
+            homeDirs.push(path.join('/home', process.env.SUDO_USER));
+        }
+
         for (const candidate of [
             '/opt/Antigravity', '/opt/Antigravity/Antigravity-x64', '/opt/antigravity',
             '/opt/antigravity/antigravity-x64', '/usr/share/antigravity', '/usr/share/Antigravity',
+            '/usr/local/share/antigravity', '/usr/local/share/Antigravity',
             '/usr/lib/antigravity', '/usr/lib/Antigravity',
         ]) add(candidate);
-        if (homeDir) {
+
+        for (const homeDir of homeDirs) {
             add(path.join(homeDir, '.local', 'share', 'antigravity'));
             add(path.join(homeDir, '.local', 'share', 'Antigravity'));
             add(path.join(homeDir, 'antigravity'));
+            add(path.join(homeDir, 'Antigravity'));
         }
 
         const desktopFiles = [
             '/usr/share/applications/antigravity.desktop',
             '/usr/share/applications/Antigravity.desktop',
-            path.join(homeDir, '.local', 'share', 'applications', 'antigravity.desktop'),
-            path.join(homeDir, '.local', 'share', 'applications', 'Antigravity.desktop'),
+            ...homeDirs.flatMap(h => [
+                path.join(h, '.local', 'share', 'applications', 'antigravity.desktop'),
+                path.join(h, '.local', 'share', 'applications', 'Antigravity.desktop'),
+            ]),
         ];
         for (const desktopFile of desktopFiles) {
             if (!desktopFile || !fs.existsSync(desktopFile)) continue;
@@ -1175,7 +1707,7 @@ function detectInstallationDir(manualDir) {
         }
 
         const which = trustedUnixTool('which');
-        for (const command of ['antigravity', 'agy']) {
+        for (const command of ['antigravity', 'agy', 'Antigravity']) {
             if (!which) break;
             const result = runTool(which, [command]);
             const executable = result.status === 0 ? (result.stdout || '').trim() : '';
@@ -1200,6 +1732,7 @@ function detectInstallationDir(manualDir) {
             }
         } catch (_) {}
     }
+    if (quiet) return null;
     throw new InstallerError('未找到 Antigravity 安装目录；请使用 --install-dir 明确指定。');
 }
 
@@ -1219,6 +1752,10 @@ function ensureWritable(resourcesDir) {
     const asarPath = path.join(resourcesDir, 'app.asar');
     fs.accessSync(resourcesDir, fs.constants.W_OK | fs.constants.X_OK);
     fs.accessSync(asarPath, fs.constants.R_OK | fs.constants.W_OK);
+    if (process.platform === 'darwin') {
+        const appBundle = findMacAppBundle(resourcesDir);
+        if (appBundle) fs.accessSync(appBundle, fs.constants.W_OK | fs.constants.X_OK);
+    }
 }
 
 function parseArguments(argv) {
@@ -1226,6 +1763,8 @@ function parseArguments(argv) {
         restore: false,
         installDir: '',
         forceKill: false,
+        noKill: false,
+        checkWrite: false,
         allowUnverifiedProduct: false,
     };
     for (let index = 0; index < argv.length; index++) {
@@ -1234,13 +1773,35 @@ function parseArguments(argv) {
         else if (argument === '--install-dir') options.installDir = argv[++index] || '';
         else if (argument.startsWith('--install-dir=')) options.installDir = argument.slice('--install-dir='.length);
         else if (argument === '--force-kill') options.forceKill = true;
+        else if (argument === '--no-kill') options.noKill = true;
+        else if (argument === '--check-write') options.checkWrite = true;
         else if (argument === '--allow-unverified-product') options.allowUnverifiedProduct = true;
         else if (argument === '--brand-title') index++;
     }
     return options;
 }
 
-function launchApp(installDir) {
+function launchApp(installDir, resourcesDir = null) {
+    if (process.platform !== 'win32') {
+        const runningUnderSudo = typeof process.getuid === 'function' &&
+            process.getuid() === 0 &&
+            process.env.SUDO_USER &&
+            process.env.SUDO_USER !== 'root';
+        if (runningUnderSudo) {
+            console.log('[提示] 当前通过 sudo 运行；为避免以 root 身份启动桌面应用，请手动启动 Antigravity。');
+            return true;
+        }
+        if (process.platform === 'darwin') {
+            const openBin = trustedUnixTool('open');
+            const targetApp = findMacAppBundle(resourcesDir || installDir) || (installDir.endsWith('.app') ? installDir : null);
+            if (openBin && targetApp && fs.existsSync(targetApp)) {
+                const child = childProcess.spawn(openBin, [targetApp], { detached: true, stdio: 'ignore', shell: false });
+                child.unref();
+                return true;
+            }
+        }
+    }
+
     const candidates = process.platform === 'win32'
         ? [path.join(installDir, 'Antigravity.exe')]
         : [
@@ -1258,25 +1819,39 @@ function launchApp(installDir) {
 }
 
 function main(argv = process.argv.slice(2)) {
+    const options = parseArguments(argv);
+
+    if (options.checkWrite) {
+        const installDir = detectInstallationDir(options.installDir, { quiet: true });
+        if (!installDir) {
+            process.exitCode = 3;
+            return false;
+        }
+        try {
+            const resourcesDir = resolveResourcesDir(installDir);
+            ensureWritable(resourcesDir);
+            process.exitCode = 0;
+            return true;
+        } catch (error) {
+            process.exitCode = ['EACCES', 'EPERM', 'EROFS'].includes(error.code) ? 2 : 3;
+            return false;
+        }
+    }
+
     try {
-        const options = parseArguments(argv);
-        resolveAsarCli();
         const installDir = detectInstallationDir(options.installDir);
         const resourcesDir = resolveResourcesDir(installDir);
         ensureWritable(resourcesDir);
 
         const wasRunning = checkIfAppIsRunning();
-        if (wasRunning && !options.forceKill) {
-            throw new InstallerError(
-                '检测到 Antigravity 正在运行。为保护未保存内容，默认不会强制结束进程；请正常退出后重试，或显式使用 --force-kill。'
-            );
+        if (wasRunning && !options.noKill) {
+            closeRunningAntigravity();
         }
-        if (wasRunning) forceCloseAntigravity();
 
         if (options.restore) restoreLocalization(resourcesDir);
         else installLocalization(resourcesDir, options);
 
-        if (wasRunning && options.forceKill && !launchApp(installDir)) {
+        if (wasRunning && !options.noKill && !launchApp(installDir, resourcesDir)) {
             console.warn('[提示] 未能自动重新启动客户端，请手动启动 Antigravity。');
         }
         return true;
@@ -1284,7 +1859,7 @@ function main(argv = process.argv.slice(2)) {
         const prefix = error instanceof InstallerError ? '[安全停止]' : '[错误]';
         console.error(`${prefix} ${error.message}`);
         if (process.platform !== 'win32' && ['EACCES', 'EPERM', 'EROFS'].includes(error.code)) {
-            console.error('[提示] 请先以普通用户运行 npm ci --ignore-scripts，再使用 sudo 执行安装脚本。');
+            console.error('[提示] 此安装目录需要管理员权限，请使用 sudo 重新执行脚本。');
         }
         process.exitCode = 1;
         return false;
@@ -1292,8 +1867,8 @@ function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+    AsarArchive,
     ENGINE_VERSION,
-    ASAR_PACKAGE_VERSION,
     InstallerError,
     archiveContainsLocalization,
     atomicReplaceArchive,
@@ -1307,10 +1882,10 @@ module.exports = {
     parseArguments,
     patchNativeMenu,
     patchPreload,
-    resolveAsarCli,
     restoreLocalization,
     runAsar,
     safeRemoveTempRoot,
+    validateArchive,
 };
 
 if (require.main === module) main();

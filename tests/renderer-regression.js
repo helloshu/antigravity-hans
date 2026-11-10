@@ -285,6 +285,19 @@ function runRendererRegression(generatedSource) {
     mount(emptySearchP);
     equal(emptySearchP.textContent, '没有与“daily”匹配的自动化。', '自动化搜索空状态碎片未重组');
 
+    // v2.30.0 dynamic rules: plan label, back navigation, schedule & voice timeline.
+    const planLabel = text('Your Plan: Google AI Pro');
+    mount(element('div', planLabel));
+    equal(planLabel.nodeValue, '您的计划: Google AI Pro', 'v2.30.0 计划名称动态规则失效');
+
+    const backNav = text('Back to Automations');
+    mount(element('button', backNav));
+    equal(backNav.nodeValue, '返回自动化', 'v2.30.0 返回导航动态规则失效');
+
+    const voiceTimeline = text('Voice chat · 13:25 · 9s');
+    mount(element('span', voiceTimeline));
+    equal(voiceTimeline.nodeValue, '语音会话 · 13:25 · 9 秒', '语音会话时间轴动态规则失效');
+
     return { assertions };
 }
 
