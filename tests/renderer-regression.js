@@ -298,6 +298,126 @@ function runRendererRegression(generatedSource) {
     mount(element('span', voiceTimeline));
     equal(voiceTimeline.nodeValue, '语音会话 · 13:25 · 9 秒', '语音会话时间轴动态规则失效');
 
+    // v2.31.0: resources settings subtitle, side pane control banner + prose guard,
+    // Automations New button context guard, Swarm skill picker, and Swarm Board subframe isolation.
+    reset();
+    const manageResources = text('Manage workspace resources and settings.');
+    mount(element('p', manageResources));
+    equal(manageResources.nodeValue, '管理工作区资源和设置.', 'v2.31.0 工作区资源设置副标题未翻译');
+
+    const sidePaneSpanName = text('Chrome');
+    const sidePaneBanner = element(
+        'div',
+        text('Stream and control '),
+        element('span', sidePaneSpanName),
+        text(' directly in the side pane.')
+    );
+    mount(sidePaneBanner);
+    equal(sidePaneBanner.textContent, '直接在侧边面板中实时查看并控制 Chrome.', 'v2.31.0 侧边面板控制横幅未重组翻译');
+    equal(sidePaneSpanName.nodeValue, 'Chrome', '侧边面板控制目标名称不应被破坏');
+
+    const proseSidePaneText = text('Stream and control Chrome directly in the side pane.');
+    const proseSidePaneContainer = element('div', proseSidePaneText);
+    proseSidePaneContainer.className = 'prose';
+    mount(proseSidePaneContainer);
+    equal(proseSidePaneText.nodeValue, 'Stream and control Chrome directly in the side pane.', '散文正文中的侧边面板提示被误翻译');
+
+    const autoNewLabel = text('New');
+    const autoNewBtn = element('button', element('span', autoNewLabel));
+    const autoPage = element(
+        'section',
+        element('div', element('h1', text('Automations')), autoNewBtn),
+        element('p', text('No automations yet'))
+    );
+    mount(autoPage);
+    equal(autoNewLabel.nodeValue, '新建', 'v2.31.0 自动化页面 New 按钮未翻译');
+
+    const modelBadgeNew = text('New');
+    const modelOption = element('button', text('Gemini 3.1 '), element('span', modelBadgeNew));
+    modelOption.setAttribute('role', 'option');
+    const modelListbox = element('div', element('div', text('Automations No automations yet')), modelOption);
+    modelListbox.setAttribute('role', 'listbox');
+    mount(modelListbox);
+    equal(modelBadgeNew.nodeValue, 'New', '模型选择器中的 New 徽标被误翻译');
+
+    const swarmSkillName = text('swarm');
+    mount(element(
+        'div',
+        element('span', swarmSkillName),
+        element('span', text('(Preview & Quota Heavy) Run a swarm: several agents working in parallel on one task'))
+    ));
+    equal(swarmSkillName.nodeValue, '蜂群协作', 'v2.31.0 swarm 技能选择器显示名未翻译');
+
+    const { generateSubframeJs } = require('../localization_engine');
+    const subframeDom = createFakeDomEnvironment(generateSubframeJs(generatedSource), {
+        protocol: 'plugin:',
+        isSubframe: true
+    });
+    const swarmBoard = subframeDom.element('div');
+    swarmBoard.id = 'board';
+    swarmBoard.setAttribute('data-testid', 'swarm-board');
+
+    const untitledSwarmText = subframeDom.text('Untitled swarm');
+    const untitledSwarmEl = subframeDom.element('h1', untitledSwarmText);
+    untitledSwarmEl.id = 'swarm-title';
+
+    const tabOverviewText = subframeDom.text('Overview');
+    const tabOverviewBtn = subframeDom.element('button', tabOverviewText);
+    tabOverviewBtn.className = 'tab';
+    tabOverviewBtn.setAttribute('role', 'tab');
+
+    const searchPostsInput = subframeDom.element('input');
+    searchPostsInput.id = 'f-search';
+    searchPostsInput.setAttribute('placeholder', 'Search');
+    searchPostsInput.setAttribute('aria-label', 'Search posts');
+
+    const emptyBodyCodeText = subframeDom.text('/swarm');
+    const emptyBodyP = subframeDom.element(
+        'p',
+        subframeDom.text('Swarms started in this conversation appear here automatically, with their board, members and @mention graph. Start one with '),
+        subframeDom.element('code', emptyBodyCodeText),
+        subframeDom.text('.')
+    );
+    emptyBodyP.id = 'empty-body';
+
+    const agentMsgText = subframeDom.text('Close Settings Open File New');
+    const agentMsgBody = subframeDom.element('div', agentMsgText);
+    agentMsgBody.className = 'msg-body';
+
+    const rawJsonText = subframeDom.text('{"status":"Open","action":"Copy"}');
+    const rawPre = subframeDom.element('div', rawJsonText);
+    rawPre.id = 'raw';
+
+    swarmBoard.append(untitledSwarmEl, tabOverviewBtn, searchPostsInput, emptyBodyP, agentMsgBody, rawPre);
+    subframeDom.mount(swarmBoard);
+
+    equal(untitledSwarmText.nodeValue, '未命名蜂群', 'Swarm 默认标题未翻译');
+    equal(tabOverviewText.nodeValue, '概览', 'Swarm 视图标签页未翻译');
+    equal(searchPostsInput.getAttribute('placeholder'), '搜索', 'Swarm 搜索框占位符未翻译');
+    equal(searchPostsInput.getAttribute('aria-label'), '搜索消息', 'Swarm 搜索框无障碍标签未翻译');
+    equal(emptyBodyCodeText.nodeValue, '/swarm', 'Swarm 空状态中的 /swarm 命令被破坏');
+    equal(
+        emptyBodyP.textContent,
+        '在此会话中启动的蜂群协作会自动显示在这里，并展示其消息板、成员和 @提及 图谱. 请使用 /swarm 启动.',
+        'Swarm 空状态引导文案未重组翻译'
+    );
+    equal(agentMsgText.nodeValue, 'Close Settings Open File New', 'Swarm 消息板智能体发言被污染');
+    equal(agentMsgText.writeCount, 0, 'Swarm 消息板智能体发言产生了 DOM 写入');
+    equal(rawJsonText.nodeValue, '{"status":"Open","action":"Copy"}', 'Swarm Raw 原始数据视图被污染');
+    equal(rawJsonText.writeCount, 0, 'Swarm Raw 原始数据视图产生了 DOM 写入');
+
+    subframeDom.reset();
+    const swarmBoardCustom = subframeDom.element('div');
+    swarmBoardCustom.id = 'board';
+    swarmBoardCustom.setAttribute('data-testid', 'swarm-board');
+    const customSwarmTitleText = subframeDom.text('Settings Refactor');
+    const customSwarmTitleEl = subframeDom.element('h1', customSwarmTitleText);
+    customSwarmTitleEl.id = 'swarm-title';
+    swarmBoardCustom.append(customSwarmTitleEl);
+    subframeDom.mount(swarmBoardCustom);
+    equal(customSwarmTitleText.nodeValue, 'Settings Refactor', '用户自定义蜂群标题被误翻译');
+    equal(customSwarmTitleText.writeCount, 0, '用户自定义蜂群标题产生了 DOM 写入');
+
     return { assertions };
 }
 

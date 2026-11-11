@@ -13,7 +13,7 @@ const {
     restoreLocalization,
     runAsar,
 } = require('../installer');
-const { SIGNATURE_START } = require('../localization_engine');
+const { SIGNATURE_START, UTILS_SUBFRAME_SIGNATURE_START } = require('../localization_engine');
 
 function makeDirectory(directory) {
     fs.mkdirSync(directory, { recursive: true });
@@ -44,8 +44,9 @@ function packSyntheticApp(resourcesDir, version, options = {}) {
     makeDirectory(path.dirname(mainPath));
     fs.writeFileSync(mainPath, [
         "const electron_1 = require('electron');",
-        "const menu = { items: [{ label: 'File', submenu: { items: [{ label: 'Quit' }] } }] };",
+        "const menu = { items: [{ label: 'File', submenu: { items: [{ label: 'Quit' }, { label: 'Actual Size' }] } }] };",
         'electron_1.Menu.setApplicationMenu(menu);',
+        "async function reportWslError(WSL_DISTRO, err) { const msg = `Failed to install the server into WSL distro \"${WSL_DISTRO}\":\\n${err.message}`; await electron_1.dialog.showErrorBox('WSL setup failed', msg); }",
     ].join('\n'));
     fs.writeFileSync(
         path.join(sourceDir, 'build', 'tray.js'),
@@ -55,6 +56,23 @@ function packSyntheticApp(resourcesDir, version, options = {}) {
         path.join(sourceDir, 'build', 'updater.js'),
         "const dialog = { title: 'Check for Updates', message: 'No updates available', buttons: ['OK'] };\n"
     );
+
+    if (options.withSubframeUtils) {
+        const utilsPath = path.join(sourceDir, 'dist', 'utils.js');
+        makeDirectory(path.dirname(utilsPath));
+        fs.writeFileSync(utilsPath, [
+            "const electron_1 = require('electron');",
+            "const path_1 = { default: require('path') };",
+            "const fs = require('fs');",
+            "function attachHub(win, hubContents, handleTitleUpdate) {",
+            "    hubContents.on?.('page-title-updated', handleTitleUpdate);",
+            "    return () => {",
+            "        hubContents.off?.('page-title-updated', handleTitleUpdate);",
+            "    };",
+            "}",
+            "module.exports = { attachHub };",
+        ].join('\n'));
+    }
 
     if (options.unpackedModule) {
         const unpackedFile = path.join(sourceDir, 'node_modules', options.unpackedModule, 'index.js');
@@ -125,11 +143,28 @@ function run() {
         assert.strictEqual(secondRestore.restoredHash, secondOfficial.baseHash);
         assert.strictEqual(hashFile(secondOfficial.archivePath), secondOfficial.baseHash);
 
-        // v2.29.0+ 带 app.asar.unpacked 解包目录的安装、覆盖重装与 SHA-256 无损还原。
-        const unpackedOfficial = packSyntheticApp(resourcesDir, '2.29.0', { unpackedModule: 'chrome-devtools-mcp' });
+        // v2.31.0+: 带 app.asar.unpacked 与 plugin:// 子框架动态钩子 (dist/utils.js + dist/subframeLocalizationPreload.js)
+        const unpackedOfficial = packSyntheticApp(resourcesDir, '2.31.0', {
+            unpackedModule: 'chrome-devtools-mcp',
+            withSubframeUtils: true,
+        });
         assert.strictEqual(fs.existsSync(`${unpackedOfficial.archivePath}.unpacked`), true);
         const unpackedFirstInstall = installLocalization(resourcesDir);
         assert.strictEqual(unpackedFirstInstall.baseHash, unpackedOfficial.baseHash);
+
+        const swarmInspect = inspectArchive(
+            unpackedOfficial.archivePath,
+            path.join(testRoot, 'inspect-localized-231')
+        );
+        const patchedUtils = fs.readFileSync(path.join(swarmInspect, 'dist', 'utils.js'), 'utf8');
+        const patchedSubframe = fs.readFileSync(path.join(swarmInspect, 'dist', 'subframeLocalizationPreload.js'), 'utf8');
+        const patchedMain = fs.readFileSync(path.join(swarmInspect, 'build', 'main.js'), 'utf8');
+        assert.ok(patchedUtils.includes(UTILS_SUBFRAME_SIGNATURE_START), 'utils.js 未注入 plugin:// 子框架钩子');
+        assert.ok(patchedSubframe.includes('__agSubframeLocalizationInstalled'), 'subframeLocalizationPreload.js 缺少子框架守卫');
+        assert.ok(patchedMain.includes("'Actual Size': '实际大小'"), '原生菜单缺少 Actual Size 词条');
+        assert.ok(patchedMain.includes("showErrorBox('WSL 设置失败'"), 'main.js WSL 错误弹窗未汉化');
+        assert.strictEqual(discoverPreload(swarmInspect).relativePath, 'dist/preload.js', 'subframeLocalizationPreload.js 干扰了主 preload 定位');
+
         const unpackedReinstall = installLocalization(resourcesDir);
         assert.strictEqual(unpackedReinstall.baseHash, unpackedOfficial.baseHash);
         const unpackedRestore = restoreLocalization(resourcesDir);

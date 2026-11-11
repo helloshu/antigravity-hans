@@ -4,7 +4,7 @@ const vm = require('vm');
 
 // Purpose-built synchronous harness for renderer safety contracts. It models
 // only the DOM APIs used here and is not a browser-compatibility substitute.
-function createFakeDomEnvironment(generatedSource) {
+function createFakeDomEnvironment(generatedSource, options = {}) {
     const activeObservers = new Set();
     const pendingMutations = [];
     let isFlushing = false;
@@ -188,6 +188,14 @@ function createFakeDomEnvironment(generatedSource) {
             this.append(new FakeTextNode(value));
         }
 
+        get id() {
+            return this.attributes.get('id') || '';
+        }
+
+        set id(value) {
+            this.setAttribute('id', value);
+        }
+
         hasAttribute(name) {
             return this.attributes.has(name);
         }
@@ -212,14 +220,40 @@ function createFakeDomEnvironment(generatedSource) {
 
         matches(selectors) {
             return String(selectors).split(',').some(selector => {
-                const value = selector.trim();
-                if (!value) return false;
-                if (value === '*') return true;
-                if (/^[a-z]+$/i.test(value)) return this.tagName === value.toUpperCase();
-                const roleMatch = value.match(/^\[role=["']?([^"'\]]+)["']?\]$/i);
-                if (roleMatch) return this.getAttribute('role') === roleMatch[1];
-                const attributeMatch = value.match(/^\[([^\]]+)\]$/);
-                return attributeMatch ? this.hasAttribute(attributeMatch[1]) : false;
+                let rest = selector.trim();
+                if (!rest) return false;
+                if (rest === '*') return true;
+                const tagMatch = rest.match(/^[a-z][a-z0-9-]*/i);
+                if (tagMatch) {
+                    if (this.tagName !== tagMatch[0].toUpperCase()) return false;
+                    rest = rest.slice(tagMatch[0].length);
+                }
+                while (rest.length > 0) {
+                    const idMatch = rest.match(/^#([A-Za-z0-9_-]+)/);
+                    if (idMatch) {
+                        if (this.id !== idMatch[1]) return false;
+                        rest = rest.slice(idMatch[0].length);
+                        continue;
+                    }
+                    const clsMatch = rest.match(/^\.([A-Za-z0-9_-]+)/);
+                    if (clsMatch) {
+                        if (!this.classList.contains(clsMatch[1])) return false;
+                        rest = rest.slice(clsMatch[0].length);
+                        continue;
+                    }
+                    const attrMatch = rest.match(/^\[([A-Za-z0-9_:-]+)(?:=["']?([^"'\]]+)["']?)?\]/);
+                    if (attrMatch) {
+                        if (attrMatch[2] !== undefined) {
+                            if (this.getAttribute(attrMatch[1]) !== attrMatch[2]) return false;
+                        } else if (!this.hasAttribute(attrMatch[1])) {
+                            return false;
+                        }
+                        rest = rest.slice(attrMatch[0].length);
+                        continue;
+                    }
+                    return false;
+                }
+                return true;
             });
         }
 
@@ -367,10 +401,30 @@ function createFakeDomEnvironment(generatedSource) {
     const body = new FakeElement('body');
     html.append(body);
 
+    const protocol = options.protocol || 'file:';
+    const location = {
+        protocol,
+        href: `${protocol}//app/`
+    };
+
     const document = {
         readyState: 'loading',
         body,
         documentElement: html,
+        getElementById(id) {
+            if (!id) return null;
+            const targetId = String(id);
+            const visit = node => {
+                if (!node || node.nodeType !== FakeNode.ELEMENT_NODE) return null;
+                if (node.id === targetId) return node;
+                for (const child of node.childNodes) {
+                    const found = visit(child);
+                    if (found) return found;
+                }
+                return null;
+            };
+            return visit(html);
+        },
         createTextNode(value) {
             return new FakeTextNode(value);
         },
@@ -383,6 +437,7 @@ function createFakeDomEnvironment(generatedSource) {
     };
 
     const window = {
+        location,
         addEventListener(type, callback) {
             addListener(windowListeners, type, callback);
         },
@@ -394,6 +449,9 @@ function createFakeDomEnvironment(generatedSource) {
     const sandbox = {
         document,
         window,
+        location,
+        self: window,
+        top: options.isSubframe ? {} : window,
         MutationObserver: FakeMutationObserver,
         Element: FakeElement,
         Node: FakeNode,

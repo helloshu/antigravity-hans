@@ -1,7 +1,7 @@
 # Antigravity 桌面客户端简体中文汉化引擎
 
-- **汉化版本**：v2.30.0
-- **匹配版本**：Antigravity v2.30.0
+- **汉化版本**：v2.31.0
+- **匹配版本**：Antigravity v2.31.0
 - **支持平台**：Windows / macOS / Linux
 - **环境要求**：Node.js 18+（零第三方依赖，无需 `npm install`）
 
@@ -37,7 +37,7 @@ cd antigravity-hans
 
 ## 目录结构
 
-- `installer.js`：零依赖安装与还原核心（v3.1.0），内置 `AsarArchive` 二进制校验与流式修补、产品身份识别、preload 动态评分定位、SHA-256 版本化备份与原子替换。
+- `installer.js`：零依赖安装与还原核心（v3.1.0），内置 `AsarArchive` 二进制校验与流式修补、产品身份识别、preload 动态评分定位、`plugin://` 扩展子框架隔离注入（`subframeLocalizationPreload.js`）、SHA-256 版本化备份与原子替换。
 - `localization_engine.js`：渲染层翻译注入代码生成器（`generateJs()`），命令行直接调用时自动委托 `installer.js`。
 - `dicts/`：模块化翻译词典目录，主版本词典固定为 `dicts/release.json`（`release.json`），分包词典包括 `common.json`、`marketplace_plugins.json`、`menu_nav.json`、`page_agents.json`、`page_mcp_knowledge.json`、`page_settings.json`、`page_workspaces.json`。
 - `scripts/verify.js`：非安装式全量词典审计与安全契约验证入口。

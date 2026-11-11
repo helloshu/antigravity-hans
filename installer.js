@@ -8,6 +8,7 @@ const vm = require('vm');
 const childProcess = require('child_process');
 const {
     generateJs,
+    generateSubframeJs,
     SIGNATURE_START,
     SIGNATURE_END,
     LEGACY_SIGNATURE_START = '/* --- ANTIGRAVITY CHINESE LOCALIZATION START --- */',
@@ -22,7 +23,13 @@ const {
     LEGACY_TRAY_SIGNATURE_END = '/* --- ANTIGRAVITY TRAY LOCALIZATION END --- */',
     IPC_CONTEXT_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY IPC CONTEXT MENU LOCALIZATION START --- */',
     IPC_CONTEXT_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY IPC CONTEXT MENU LOCALIZATION END --- */',
+    MAIN_SUBFRAME_SIGNATURE_START = "'__ANTIGRAVITY_MAIN_SUBFRAME_LOCALIZATION_START__';",
+    MAIN_SUBFRAME_SIGNATURE_END = "'__ANTIGRAVITY_MAIN_SUBFRAME_LOCALIZATION_END__';",
+    UTILS_SUBFRAME_SIGNATURE_START = "'__ANTIGRAVITY_UTILS_SUBFRAME_LOCALIZATION_START__';",
+    UTILS_SUBFRAME_SIGNATURE_END = "'__ANTIGRAVITY_UTILS_SUBFRAME_LOCALIZATION_END__';",
 } = require('./localization_engine');
+
+const SUBFRAME_PRELOAD_BASENAME = 'subframeLocalizationPreload.js';
 
 const ALT_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION START --- */';
 const ALT_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION END --- */';
@@ -415,6 +422,7 @@ class AsarArchive {
         }
         const { header, baseOffset } = this.readHeader(sourceAsar);
         const normalizedPatches = new Map();
+        const newPaths = new Set();
 
         for (const [rawPath, content] of Object.entries(filePatches || {})) {
             const relPath = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
@@ -422,7 +430,8 @@ class AsarArchive {
             if (parts.length === 0 || !parts.every(isSafeArchiveEntryName)) {
                 throw new InstallerError(`非法补丁路径: ${rawPath}`);
             }
-            normalizedPatches.set(parts.join('/'), content);
+            const normalizedPath = parts.join('/');
+            normalizedPatches.set(normalizedPath, content);
 
             let cur = header.files;
             for (let i = 0; i < parts.length - 1; i++) {
@@ -439,6 +448,7 @@ class AsarArchive {
                 delete cur[leaf];
             } else if (!cur[leaf]) {
                 const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8');
+                newPaths.add(normalizedPath);
                 cur[leaf] = {
                     size: buf.length,
                     offset: '0',
@@ -465,6 +475,9 @@ class AsarArchive {
 
             const packedFiles = fileEntries.filter(f => !f.entry.unpacked && f.entry.offset !== undefined);
             packedFiles.sort((a, b) => {
+                const aNew = newPaths.has(a.path) ? 1 : 0;
+                const bNew = newPaths.has(b.path) ? 1 : 0;
+                if (aNew !== bNew) return aNew - bNew;
                 const diff = Number(a.entry.offset) - Number(b.entry.offset);
                 return diff !== 0 ? diff : a.path.localeCompare(b.path);
             });
@@ -732,7 +745,10 @@ function hasPreloadEvidence(content) {
 
 function discoverPreload(target) {
     const isArchive = isAsarFile(target);
-    const jsFiles = listTargetFiles(target, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
+    const jsFiles = listTargetFiles(target, relPath => {
+        if (!/\.(?:js|cjs|mjs)$/i.test(relPath)) return false;
+        return path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase() !== SUBFRAME_PRELOAD_BASENAME.toLowerCase();
+    });
     const namedCandidates = jsFiles.filter(p => path.basename(p).toLowerCase().includes('preload'));
     const candidates = [];
     const inspected = new Set();
@@ -784,11 +800,16 @@ function readLocalizationMetadata(target) {
 function archiveContainsLocalization(target) {
     if (readLocalizationMetadata(target)) return true;
     const jsFiles = listTargetFiles(target, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
-    const priority = jsFiles.filter(p => /preload|menu|tray|ipcHandlers/i.test(p));
-    const rest = jsFiles.filter(p => !/preload|menu|tray|ipcHandlers/i.test(p));
+    const priority = jsFiles.filter(p => /preload|menu|tray|ipcHandlers|utils/i.test(p));
+    const rest = jsFiles.filter(p => !/preload|menu|tray|ipcHandlers|utils/i.test(p));
     for (const itemPath of [...priority, ...rest]) {
         const content = readTargetTextFile(target, itemPath);
-        if (content && (content.includes(SIGNATURE_START) || content.includes(LEGACY_SIGNATURE_START))) {
+        if (
+            content &&
+            (content.includes(SIGNATURE_START) ||
+                content.includes(LEGACY_SIGNATURE_START) ||
+                content.includes(UTILS_SUBFRAME_SIGNATURE_START))
+        ) {
             return true;
         }
     }
@@ -820,17 +841,24 @@ function compileCheckJs(source, label) {
     }
 }
 
-function buildPatchedPreloadContent(rawPreloadContent) {
+function buildPatchedPreloadContent(rawPreloadContent, generatedJs = null) {
     let cleaned = cleanLocalizationBlock(rawPreloadContent).trimEnd();
     cleaned = cleaned.replace(
         "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', items),",
         "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', typeof globalThis.__agTranslateContextMenuItems === 'function' ? globalThis.__agTranslateContextMenuItems(items) : items),"
     );
-    const generated = generateJs();
+    const generated = generatedJs || generateJs();
     compileCheckJs(generated, 'generated-localization-injection.js');
     const combined = `${cleaned}\n\n${generated}\n`;
     compileCheckJs(combined, 'preload.patched.js');
     return combined;
+}
+
+function buildSubframeLocalizationContent(generatedJs = null) {
+    const generated = generatedJs || generateJs();
+    const subframeJs = generateSubframeJs(generated);
+    compileCheckJs(subframeJs, SUBFRAME_PRELOAD_BASENAME);
+    return subframeJs;
 }
 
 function patchPreload(extractedDir) {
@@ -849,7 +877,7 @@ function buildMenuTranslationBlock(menuVariable) {
         'Docs': '文档', 'Check for Updates': '检查更新', 'Toggle Developer Tools': '切换开发者工具',
         'Undo': '撤销', 'Redo': '重做', 'Cut': '剪切', 'Copy': '复制', 'Paste': '粘贴',
         'Select All': '全选', 'Minimize': '最小化', 'Maximize': '最大化', 'Close': '关闭',
-        'Zoom': '缩放', 'Reset Zoom': '重置缩放', 'Zoom In': '放大', 'Zoom Out': '缩小',
+        'Zoom': '缩放', 'Actual Size': '实际大小', 'Reset Zoom': '重置缩放', 'Zoom In': '放大', 'Zoom Out': '缩小',
         'Toggle Full Screen': '切换全屏', 'Version': '版本',
         'About Antigravity': '关于 Antigravity', 'Services': '服务',
         'Hide Antigravity': '隐藏 Antigravity', 'Hide Others': '隐藏其他',
@@ -931,6 +959,11 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
     let result = cleanMarkedBlock(content, TRAY_SIGNATURE_START, TRAY_SIGNATURE_END);
     result = cleanMarkedBlock(result, LEGACY_TRAY_SIGNATURE_START, LEGACY_TRAY_SIGNATURE_END);
     result = cleanMarkedBlock(result, IPC_CONTEXT_MENU_SIGNATURE_START, IPC_CONTEXT_MENU_SIGNATURE_END);
+    result = cleanMarkedBlock(result, MAIN_SUBFRAME_SIGNATURE_START, MAIN_SUBFRAME_SIGNATURE_END);
+    result = cleanMarkedBlock(result, UTILS_SUBFRAME_SIGNATURE_START, UTILS_SUBFRAME_SIGNATURE_END);
+    result = result
+        .replace("await electron_1.dialog.showErrorBox('WSL 设置失败', msg);", "await electron_1.dialog.showErrorBox('WSL setup failed', msg);")
+        .replace('`未能将服务端安装至 WSL 分发版 "${WSL_DISTRO}"：\\n${err.message}`', '`Failed to install the server into WSL distro "${WSL_DISTRO}":\\n${err.message}`');
 
     const looksLikeTray = /No agents running|createTray\s*\(|new\s+Tray\s*\(/.test(result);
     if (looksLikeTray) {
@@ -1122,6 +1155,75 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
         result = result.replace(matchedHeader, replacementHeader);
     }
 
+    const onAnchor = "hubContents.on?.('page-title-updated', handleTitleUpdate);";
+    const offAnchor = "hubContents.off?.('page-title-updated', handleTitleUpdate);";
+    if (result.includes(onAnchor) && result.includes(offAnchor)) {
+        const onHookJs = `${UTILS_SUBFRAME_SIGNATURE_START}
+    let cachedSubframeLocalizationScript = null;
+    const findSubframeById = (frame, processId, routingId) => {
+        if (!frame) {
+            return null;
+        }
+        if (frame.processId === processId && frame.routingId === routingId) {
+            return frame;
+        }
+        const children = Array.isArray(frame.framesInSubtree)
+            ? frame.framesInSubtree
+            : (Array.isArray(frame.frames) ? frame.frames : []);
+        for (const child of children) {
+            if (!child || child === frame) {
+                continue;
+            }
+            if (child.processId === processId && child.routingId === routingId) {
+                return child;
+            }
+            const nested = Array.isArray(frame.framesInSubtree) ? null : findSubframeById(child, processId, routingId);
+            if (nested) {
+                return nested;
+            }
+        }
+        return null;
+    };
+    const localizePluginSubframe = (_event, isMainFrame, frameProcessId, frameRoutingId) => {
+        try {
+            if (isMainFrame || (typeof win !== 'undefined' && win?.isDestroyed?.()) || hubContents.isDestroyed?.()) {
+                return;
+            }
+            const electronMod = typeof electron_1 !== 'undefined' && electron_1 ? electron_1 : require('electron');
+            const frame = _event?.frame
+                || electronMod.webFrameMain?.fromId?.(frameProcessId, frameRoutingId)
+                || findSubframeById(hubContents.mainFrame, frameProcessId, frameRoutingId);
+            if (!frame || frame === hubContents.mainFrame || frame.isDestroyed?.() || frame.detached) {
+                return;
+            }
+            const frameUrl = typeof frame.url === 'string' ? frame.url : '';
+            if (!frameUrl.startsWith('plugin://')) {
+                return;
+            }
+            if (cachedSubframeLocalizationScript === null) {
+                const pathMod = typeof path_1 !== 'undefined' && path_1?.default ? path_1.default : require('path');
+                const fsMod = typeof fs !== 'undefined' && fs && typeof fs.readFileSync === 'function' ? fs : require('fs');
+                const scriptPath = pathMod.join(__dirname, '${SUBFRAME_PRELOAD_BASENAME}');
+                if (!fsMod.existsSync(scriptPath)) {
+                    return;
+                }
+                cachedSubframeLocalizationScript = fsMod.readFileSync(scriptPath, 'utf-8');
+            }
+            if (cachedSubframeLocalizationScript) {
+                void Promise.resolve(frame.executeJavaScript(cachedSubframeLocalizationScript, false)).catch(() => undefined);
+            }
+        }
+        catch (_err) {}
+    };
+    hubContents.on?.('did-frame-finish-load', localizePluginSubframe);${UTILS_SUBFRAME_SIGNATURE_END}`;
+        const offHookJs = `${UTILS_SUBFRAME_SIGNATURE_START}
+        hubContents.off?.('did-frame-finish-load', localizePluginSubframe);
+        cachedSubframeLocalizationScript = null;${UTILS_SUBFRAME_SIGNATURE_END}`;
+        result = result
+            .replace(onAnchor, onAnchor + onHookJs)
+            .replace(offAnchor, offAnchor + offHookJs);
+    }
+
     if (result !== content) {
         compileCheckJs(result, relPath);
     }
@@ -1130,10 +1232,15 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
 
 function buildArchivePatches(baseArchive) {
     const filePatches = {};
+    const generatedJs = generateJs();
+    compileCheckJs(generatedJs, 'generated-localization-injection.js');
     const preloadCandidate = discoverPreload(baseArchive);
-    filePatches[preloadCandidate.relativePath] = buildPatchedPreloadContent(preloadCandidate.content);
+    filePatches[preloadCandidate.relativePath] = buildPatchedPreloadContent(preloadCandidate.content, generatedJs);
 
-    const jsRelPaths = listTargetFiles(baseArchive, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
+    const jsRelPaths = listTargetFiles(baseArchive, relPath => {
+        if (!/\.(?:js|cjs|mjs)$/i.test(relPath)) return false;
+        return path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase() !== SUBFRAME_PRELOAD_BASENAME.toLowerCase();
+    });
     let menuPath = null;
     const menuCandidates = [];
 
@@ -1160,6 +1267,7 @@ function buildArchivePatches(baseArchive) {
     }
 
     const optionalFiles = [];
+    let subframeScript = null;
     for (const relPath of jsRelPaths) {
         if (relPath === preloadCandidate.relativePath) continue;
         const sourceContent = filePatches[relPath] || readTargetTextFile(baseArchive, relPath);
@@ -1168,6 +1276,20 @@ function buildArchivePatches(baseArchive) {
         if (patchedContent !== sourceContent) {
             filePatches[relPath] = patchedContent;
             if (relPath !== menuPath) optionalFiles.push(relPath);
+        }
+        if (patchedContent.includes(UTILS_SUBFRAME_SIGNATURE_START)) {
+            if (subframeScript === null) {
+                subframeScript = buildSubframeLocalizationContent(generatedJs);
+            }
+            const normalizedRel = relPath.replace(/\\/g, '/');
+            const dirName = path.posix.dirname(normalizedRel);
+            const subframeRelPath = dirName && dirName !== '.'
+                ? `${dirName}/${SUBFRAME_PRELOAD_BASENAME}`
+                : SUBFRAME_PRELOAD_BASENAME;
+            filePatches[subframeRelPath] = subframeScript;
+            if (!optionalFiles.includes(subframeRelPath)) {
+                optionalFiles.push(subframeRelPath);
+            }
         }
     }
 

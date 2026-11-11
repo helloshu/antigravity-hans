@@ -4,8 +4,8 @@ These instructions apply to every AI agent and contributor working in this repos
 
 ## 1. Current target, project structure, and sources of truth
 
-- The current localization release is **v2.30.0**, targeting the official **Antigravity v2.30.0** client. The fixed main release dictionary is `dicts/release.json`; keep the version in `package.json`, `AGENTS.md`, and `README.md` consistent.
-- `installer.js` is the zero-dependency, version-independent installation and restoration engine built on a hardened `AsarArchive` binary stream patcher. `localization_engine.js` loads `dicts/*.json` and generates the renderer translation injection (`generateJs()`). Importing `localization_engine.js` is strictly side-effect free; CLI execution delegates to `installer.js`.
+- The current localization release is **v2.31.0**, targeting the official **Antigravity v2.31.0** client. The fixed main release dictionary is `dicts/release.json`; keep the version in `package.json`, `AGENTS.md`, and `README.md` consistent.
+- `installer.js` is the zero-dependency, version-independent installation and restoration engine built on a hardened `AsarArchive` binary stream patcher (patching `preload`, main-process menus/dialogs, and `plugin://` extension subframe localization hooks via `subframeLocalizationPreload.js`). `localization_engine.js` loads `dicts/*.json` and generates the renderer translation injection (`generateJs()`). Importing `localization_engine.js` is strictly side-effect free; CLI execution delegates to `installer.js`.
 - Never introduce `npx`, shell command strings (`execSync` / `shell: true`), or direct in-place mutation of live `app.asar`. System tools must be invoked with `shell: false` and explicit argument arrays.
 - Installer compatibility is structural rather than a promise to translate unseen future strings. Unknown or ambiguous application layouts must fail closed without replacing `app.asar`.
 - The engine loads **every** `dicts/*.json` file in lexicographic filename order (`dicts/release.json` loads last and overrides earlier keys if needed, though cross-dictionary duplicates are forbidden by `scripts/verify.js`).
