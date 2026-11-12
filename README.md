@@ -1,7 +1,7 @@
 # Antigravity 桌面客户端简体中文汉化引擎
 
-- **汉化版本**：v2.31.0
-- **匹配版本**：Antigravity v2.31.0
+- **汉化版本**：v2.31.2
+- **匹配版本**：Antigravity v2.31.2
 - **支持平台**：Windows / macOS / Linux
 - **环境要求**：Node.js 18+（零第三方依赖，无需 `npm install`）
 

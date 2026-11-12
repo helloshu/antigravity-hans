@@ -144,7 +144,7 @@ function run() {
         assert.strictEqual(hashFile(secondOfficial.archivePath), secondOfficial.baseHash);
 
         // v2.31.0+: 带 app.asar.unpacked 与 plugin:// 子框架动态钩子 (dist/utils.js + dist/subframeLocalizationPreload.js)
-        const unpackedOfficial = packSyntheticApp(resourcesDir, '2.31.0', {
+        const unpackedOfficial = packSyntheticApp(resourcesDir, '2.31.2', {
             unpackedModule: 'chrome-devtools-mcp',
             withSubframeUtils: true,
         });
