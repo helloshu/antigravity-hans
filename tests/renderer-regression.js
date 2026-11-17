@@ -418,6 +418,97 @@ function runRendererRegression(generatedSource) {
     equal(customSwarmTitleText.nodeValue, 'Settings Refactor', '用户自定义蜂群标题被误翻译');
     equal(customSwarmTitleText.writeCount, 0, '用户自定义蜂群标题产生了 DOM 写入');
 
+    // v2.32.1: mcp-app-development 技能选择器显示名
+    reset();
+    const mcpAppSkillName = text('mcp-app-development');
+    mount(element(
+        'div',
+        element('span', mcpAppSkillName),
+        element('span', text("Build, package, and debug MCP Apps for Antigravity: MCP server tools whose results render as interactive UI in the conversation, in the side pane, or full-page from the sidebar. Use when adding a UI to an MCP tool, building or theming the app itself, packaging it as a plugin, or debugging an app that doesn't render or behave as expected."))
+    ));
+    equal(mcpAppSkillName.nodeValue, 'MCP 应用开发', 'v2.32.1 mcp-app-development 技能选择器显示名未翻译');
+
+    // v2.32.1 Issue #5: 代码预览区 (.code-line / data-line-tokens / code-gutter) 严禁误翻英文标识符
+    reset();
+    const codeLineTok = text('Settings');
+    const codeLineEl = element('div', element('span', codeLineTok));
+    codeLineEl.className = 'code-line';
+    const tokenAttrText = text('Delete');
+    const tokenAttrSpan = element('span', tokenAttrText);
+    tokenAttrSpan.setAttribute('data-line-tokens', '1');
+    const gutterText = text('Open');
+    const gutterDiv = element('div', gutterText);
+    gutterDiv.setAttribute('data-testid', 'code-gutter');
+    mount(codeLineEl, tokenAttrSpan, gutterDiv);
+    equal(codeLineTok.nodeValue, 'Settings', '.code-line 内代码标识符被误翻译');
+    equal(codeLineTok.writeCount, 0, '.code-line 产生了 DOM 写入');
+    equal(tokenAttrText.nodeValue, 'Delete', 'data-line-tokens 内代码标识符被误翻译');
+    equal(tokenAttrText.writeCount, 0, 'data-line-tokens 产生了 DOM 写入');
+    equal(gutterText.nodeValue, 'Open', 'code-gutter 行号区被误翻译');
+    equal(gutterText.writeCount, 0, 'code-gutter 产生了 DOM 写入');
+
+    // v2.32.1: 思考块内模型不可用自动重试提示应正常翻译，但普通思考正文保持英文原样
+    reset();
+    const retryThoughtHeader = element('button', text('Thought for 2s'));
+    const normalThoughtText = text('Settings Open Close Copy');
+    const retryBannerText = text('Model unavailable, retrying in 5s (attempt 1/3)');
+    const retryThoughtBody = element('div', element('p', normalThoughtText), element('div', retryBannerText));
+    mount(element('div', retryThoughtHeader, retryThoughtBody));
+    equal(normalThoughtText.nodeValue, 'Settings Open Close Copy', '思考块内正常推理文本被污染');
+    equal(retryBannerText.nodeValue, '模型不可用，将在 5 秒后重试 (第 1/3 次尝试)', '思考块内模型不可用重试提示未翻译');
+
+    // v2.32.1: side-question-origin 侧边提问来源栏翻译固定结构并保留自定义会话标题原样
+    reset();
+    const sqLead = text('Started from');
+    const sqCustomTitle = text('“Settings Refactor”');
+    const sqCustomSpan = element('span', sqCustomTitle);
+    sqCustomSpan.className = 'truncate';
+    const sqShow = text('Show');
+    const sqOriginBtn = element('button', element('span', sqLead), sqCustomSpan, element('span', sqShow));
+    sqOriginBtn.setAttribute('data-testid', 'side-question-origin');
+    sqOriginBtn.setAttribute('aria-label', 'Started from “Settings Refactor”. Show in main conversation');
+    const sqMainLead = text('Started during');
+    const sqMainTarget = text('the main conversation');
+    const sqMainTargetSpan = element('span', sqMainTarget);
+    sqMainTargetSpan.className = 'truncate';
+    const sqOriginMainBtn = element('button', element('span', sqMainLead), sqMainTargetSpan);
+    sqOriginMainBtn.setAttribute('data-testid', 'side-question-origin');
+    mount(sqOriginBtn, sqOriginMainBtn);
+    equal(sqLead.nodeValue, '发起自', 'side-question-origin 引导词未翻译');
+    equal(sqCustomTitle.nodeValue, '“Settings Refactor”', 'side-question-origin 自定义会话名被误翻译');
+    equal(sqCustomTitle.writeCount, 0, 'side-question-origin 自定义会话名产生了 DOM 写入');
+    equal(sqShow.nodeValue, '显示', 'side-question-origin Show 按钮未翻译');
+    equal(sqOriginBtn.getAttribute('aria-label'), '发起自 “Settings Refactor”. 在主会话中显示', 'side-question-origin aria-label 未翻译');
+    equal(sqMainLead.nodeValue, '进行中发起自', 'side-question-origin Started during 未翻译');
+    equal(sqMainTarget.nodeValue, '主会话', 'side-question-origin the main conversation 未翻译');
+
+    // v2.32.1: 本地克隆与 SSH 远程连接文案
+    reset();
+    const localCloneText = text('Uses your local clone, antigravity-hans');
+    const sshConnectingText = text('Connecting to dev-box…');
+    const sshConnectMenuText = text('Connect to SSH Host…');
+    mount(
+        element('span', localCloneText),
+        element('span', sshConnectingText),
+        element('span', sshConnectMenuText)
+    );
+    equal(localCloneText.nodeValue, '使用您的本地克隆，antigravity-hans', '本地克隆动态提示未翻译');
+    equal(sshConnectingText.nodeValue, '正在连接至 dev-box…', 'SSH 连接中动态提示未翻译');
+    equal(sshConnectMenuText.nodeValue, '连接至 SSH 主机…', 'SSH 连接菜单项未翻译');
+
+    // v2.32.1: 外部非本地源页面严禁挂载观察器或改写任何 DOM
+    const externalDom = createFakeDomEnvironment(generatedSource, {
+        protocol: 'https:',
+        hostname: 'example.com',
+        host: 'example.com',
+        href: 'https://example.com/docs',
+        expectBlockedContext: true,
+    });
+    equal(externalDom.observerCount(), 0, '外部源页面不应注册 MutationObserver');
+    const extText = externalDom.text('Settings');
+    externalDom.mount(externalDom.element('button', extText));
+    equal(extText.nodeValue, 'Settings', '外部源页面文本被误改写');
+
     return { assertions };
 }
 

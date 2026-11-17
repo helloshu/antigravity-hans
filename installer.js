@@ -27,9 +27,15 @@ const {
     MAIN_SUBFRAME_SIGNATURE_END = "'__ANTIGRAVITY_MAIN_SUBFRAME_LOCALIZATION_END__';",
     UTILS_SUBFRAME_SIGNATURE_START = "'__ANTIGRAVITY_UTILS_SUBFRAME_LOCALIZATION_START__';",
     UTILS_SUBFRAME_SIGNATURE_END = "'__ANTIGRAVITY_UTILS_SUBFRAME_LOCALIZATION_END__';",
+    CTX_MONITOR_MAIN_START = "'__AG_CTX_MONITOR_START__';",
+    CTX_MONITOR_MAIN_END = "'__AG_CTX_MONITOR_END__';",
+    CTX_BRIDGE_PRELOAD_START = "'__AG_CTX_BRIDGE_START__';",
+    CTX_BRIDGE_PRELOAD_END = "'__AG_CTX_BRIDGE_END__';",
 } = require('./localization_engine');
 
 const SUBFRAME_PRELOAD_BASENAME = 'subframeLocalizationPreload.js';
+const CONTEXT_MONITOR_SOURCE_FILE = 'context_monitor.js';
+const CONTEXT_MONITOR_BASENAME = 'contextMonitor.js';
 
 const ALT_MENU_SIGNATURE_START = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION START --- */';
 const ALT_MENU_SIGNATURE_END = '/* --- ANTIGRAVITY NATIVE MENU LOCALIZATION END --- */';
@@ -745,9 +751,13 @@ function hasPreloadEvidence(content) {
 
 function discoverPreload(target) {
     const isArchive = isAsarFile(target);
+    const excludedHelperNames = new Set([
+        SUBFRAME_PRELOAD_BASENAME.toLowerCase(),
+        CONTEXT_MONITOR_BASENAME.toLowerCase(),
+    ]);
     const jsFiles = listTargetFiles(target, relPath => {
         if (!/\.(?:js|cjs|mjs)$/i.test(relPath)) return false;
-        return path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase() !== SUBFRAME_PRELOAD_BASENAME.toLowerCase();
+        return !excludedHelperNames.has(path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase());
     });
     const namedCandidates = jsFiles.filter(p => path.basename(p).toLowerCase().includes('preload'));
     const candidates = [];
@@ -800,15 +810,17 @@ function readLocalizationMetadata(target) {
 function archiveContainsLocalization(target) {
     if (readLocalizationMetadata(target)) return true;
     const jsFiles = listTargetFiles(target, relPath => /\.(?:js|cjs|mjs)$/i.test(relPath));
-    const priority = jsFiles.filter(p => /preload|menu|tray|ipcHandlers|utils/i.test(p));
-    const rest = jsFiles.filter(p => !/preload|menu|tray|ipcHandlers|utils/i.test(p));
+    const priority = jsFiles.filter(p => /preload|main|menu|tray|ipcHandlers|utils/i.test(p));
+    const rest = jsFiles.filter(p => !/preload|main|menu|tray|ipcHandlers|utils/i.test(p));
     for (const itemPath of [...priority, ...rest]) {
         const content = readTargetTextFile(target, itemPath);
         if (
             content &&
             (content.includes(SIGNATURE_START) ||
                 content.includes(LEGACY_SIGNATURE_START) ||
-                content.includes(UTILS_SUBFRAME_SIGNATURE_START))
+                content.includes(UTILS_SUBFRAME_SIGNATURE_START) ||
+                content.includes(CTX_MONITOR_MAIN_START) ||
+                content.includes(CTX_BRIDGE_PRELOAD_START))
         ) {
             return true;
         }
@@ -827,6 +839,7 @@ function cleanMarkedBlock(content, startMarker, endMarker) {
 function cleanLocalizationBlock(content) {
     let result = cleanMarkedBlock(content, SIGNATURE_START, SIGNATURE_END);
     result = cleanMarkedBlock(result, LEGACY_SIGNATURE_START, LEGACY_SIGNATURE_END);
+    result = cleanMarkedBlock(result, CTX_BRIDGE_PRELOAD_START, CTX_BRIDGE_PRELOAD_END);
     return result.replace(
         "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', typeof globalThis.__agTranslateContextMenuItems === 'function' ? globalThis.__agTranslateContextMenuItems(items) : items),",
         "showContextMenu: (items) => electron_1.ipcRenderer.invoke('window:show-context-menu', items),"
@@ -961,9 +974,14 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
     result = cleanMarkedBlock(result, IPC_CONTEXT_MENU_SIGNATURE_START, IPC_CONTEXT_MENU_SIGNATURE_END);
     result = cleanMarkedBlock(result, MAIN_SUBFRAME_SIGNATURE_START, MAIN_SUBFRAME_SIGNATURE_END);
     result = cleanMarkedBlock(result, UTILS_SUBFRAME_SIGNATURE_START, UTILS_SUBFRAME_SIGNATURE_END);
+    result = cleanMarkedBlock(result, CTX_MONITOR_MAIN_START, CTX_MONITOR_MAIN_END);
     result = result
         .replace("await electron_1.dialog.showErrorBox('WSL 设置失败', msg);", "await electron_1.dialog.showErrorBox('WSL setup failed', msg);")
-        .replace('`未能将服务端安装至 WSL 分发版 "${WSL_DISTRO}"：\\n${err.message}`', '`Failed to install the server into WSL distro "${WSL_DISTRO}":\\n${err.message}`');
+        .replace('`未能将服务端安装至 WSL 分发版 "${WSL_DISTRO}"：\\n${err.message}`', '`Failed to install the server into WSL distro "${WSL_DISTRO}":\\n${err.message}`')
+        .replace('MenuUpdateStep["CheckForUpdates"] = "检查更新";', 'MenuUpdateStep["CheckForUpdates"] = "Check for Updates";')
+        .replace('MenuUpdateStep["CheckingForUpdates"] = "正在检查更新...";', 'MenuUpdateStep["CheckingForUpdates"] = "Checking for Updates...";')
+        .replace('MenuUpdateStep["DownloadingUpdate"] = "正在下载更新...";', 'MenuUpdateStep["DownloadingUpdate"] = "Downloading Update...";')
+        .replace('MenuUpdateStep["RestartToUpdate"] = "重启以更新";', 'MenuUpdateStep["RestartToUpdate"] = "Restart to Update";');
 
     const looksLikeTray = /No agents running|createTray\s*\(|new\s+Tray\s*\(/.test(result);
     if (looksLikeTray) {
@@ -1036,9 +1054,13 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
             .replace('`Failed to install the server into WSL distro "${WSL_DISTRO}":\\n${err.message}`', '`未能将服务端安装至 WSL 分发版 "${WSL_DISTRO}"：\\n${err.message}`');
     }
 
-    const looksLikeUpdater = result.includes('Check for Updates') && result.includes('No updates available');
+    const looksLikeUpdater = (result.includes('Check for Updates') && result.includes('No updates available'))
+        || result.includes('MenuUpdateStep["CheckForUpdates"]');
     if (looksLikeUpdater) {
         result = replaceStringLiteral(result, 'Check for Updates', '检查更新');
+        result = replaceStringLiteral(result, 'Checking for Updates...', '正在检查更新...');
+        result = replaceStringLiteral(result, 'Downloading Update...', '正在下载更新...');
+        result = replaceStringLiteral(result, 'Restart to Update', '重启以更新');
         result = replaceStringLiteral(result, 'No updates available', '暂无可用更新');
         result = replaceStringLiteral(result, 'OK', '确定');
     }
@@ -1109,16 +1131,23 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
         "Save Video": "保存视频",
         "Close Tab": "关闭标签页",
         "Close Other Tabs": "关闭其他标签页",
+        "Close Tabs to the Left": "关闭左侧标签页",
         "Close Tabs to the Right": "关闭右侧标签页",
+        "Pin Tab": "置顶标签页",
+        "Unpin Tab": "取消置顶标签页",
+        "Keep Open": "保持打开",
         "Back": "后退",
         "Forward": "前进",
         "Reload": "重新加载",
         "Open in External Browser": "在外部浏览器中打开",
         "Open in Built-in Browser": "在内置浏览器中打开",
         "Open in Browser": "在浏览器中打开",
+        "Open in Side Panel": "在侧边面板中打开",
         "Open in": "打开方式",
         "Open In": "打开方式",
         "Built-in Browser (Default)": "内置浏览器 (默认)",
+        "Side Panel (Default)": "侧边面板 (默认)",
+        "Side Panel": "侧边面板",
         "External Browser": "外部浏览器",
         "Settings": "设置",
         "Copy Message": "复制消息",
@@ -1127,6 +1156,19 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
         "Reopen Closed Tab": "重新打开关闭的标签页",
         "Move Conversation Up": "向上移动会话",
         "Move Conversation Down": "向下移动会话",
+        "Move to Group": "移动到分组",
+        "New Group": "新建分组",
+        "Remove from Group": "从分组中移除",
+        "Restore": "恢复",
+        "Delete Permanently": "彻底删除",
+        "View Debug": "查看调试信息",
+        "Share": "分享",
+        "Telemetry": "遥测数据",
+        "Fork": "复刻",
+        "Fork in Current Workspace": "在当前工作区中复刻",
+        "Fork in Shared Workspace": "在共享工作区中复刻",
+        "Fork in New Workspace": "在新工作区中复刻",
+        "Fork conversation in this folder": "在此文件夹中复刻会话",
         "Background Commands": "后台命令",
         "Background Tasks": "后台任务"
     };
@@ -1230,16 +1272,43 @@ function applyOptionalMainProcessPatch(content, relPath = 'main-process.js') {
     return result;
 }
 
-function buildArchivePatches(baseArchive) {
+function buildContextBridgePreloadBlock() {
+    return `${CTX_BRIDGE_PRELOAD_START}
+(() => {
+    try {
+        const g = globalThis;
+        const loc = g.location;
+        if (loc) {
+            const proto = typeof loc.protocol === 'string' ? loc.protocol.toLowerCase() : '';
+            const host = typeof loc.hostname === 'string' ? loc.hostname.toLowerCase() : '';
+            if ((proto !== 'http:' && proto !== 'https:') || (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]' && host !== '::1' && !host.endsWith('.localhost'))) return;
+        }
+        if (g.top && g.self && g.top !== g.self) return;
+        const el = typeof electron_1 !== 'undefined' && electron_1 ? electron_1 : (typeof require === 'function' ? require('electron') : null);
+        if (el && el.contextBridge && el.ipcRenderer) {
+            el.contextBridge.exposeInMainWorld('__agCtxBridge', {
+                getMetrics: (id, force, details) => el.ipcRenderer.invoke('ag-ctx:metrics', id, Boolean(force), Boolean(details))
+            });
+        }
+    } catch (_e) {}
+})();
+${CTX_BRIDGE_PRELOAD_END}`;
+}
+
+function buildArchivePatches(baseArchive, options = {}) {
     const filePatches = {};
     const generatedJs = generateJs();
     compileCheckJs(generatedJs, 'generated-localization-injection.js');
     const preloadCandidate = discoverPreload(baseArchive);
     filePatches[preloadCandidate.relativePath] = buildPatchedPreloadContent(preloadCandidate.content, generatedJs);
 
+    const excludedHelperNames = new Set([
+        SUBFRAME_PRELOAD_BASENAME.toLowerCase(),
+        CONTEXT_MONITOR_BASENAME.toLowerCase(),
+    ]);
     const jsRelPaths = listTargetFiles(baseArchive, relPath => {
         if (!/\.(?:js|cjs|mjs)$/i.test(relPath)) return false;
-        return path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase() !== SUBFRAME_PRELOAD_BASENAME.toLowerCase();
+        return !excludedHelperNames.has(path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase());
     });
     let menuPath = null;
     const menuCandidates = [];
@@ -1293,11 +1362,63 @@ function buildArchivePatches(baseArchive) {
         }
     }
 
+    let contextMonitorPath = null;
+    const contextMonitorSourcePath = path.join(__dirname, CONTEXT_MONITOR_SOURCE_FILE);
+    if (options.contextMonitor !== false && fs.existsSync(contextMonitorSourcePath)) {
+        const preloadNorm = preloadCandidate.relativePath.replace(/\\/g, '/');
+        const preloadDir = path.posix.dirname(preloadNorm);
+        const preferredMainRel = preloadDir && preloadDir !== '.' ? `${preloadDir}/main.js` : 'main.js';
+        const mainCandidates = jsRelPaths
+            .filter(relPath => path.posix.basename(relPath.replace(/\\/g, '/')).toLowerCase() === 'main.js')
+            .sort((a, b) => {
+                const aNorm = a.replace(/\\/g, '/');
+                const bNorm = b.replace(/\\/g, '/');
+                if (aNorm === preferredMainRel) return -1;
+                if (bNorm === preferredMainRel) return 1;
+                return aNorm.split('/').length - bNorm.split('/').length || aNorm.localeCompare(bNorm);
+            });
+
+        if (mainCandidates.length > 0) {
+            const mainRelPath = mainCandidates[0];
+            const mainSource = filePatches[mainRelPath] || readTargetTextFile(baseArchive, mainRelPath);
+            if (mainSource !== null) {
+                const contextMonitorSrc = fs.readFileSync(contextMonitorSourcePath, 'utf8');
+                compileCheckJs(contextMonitorSrc, CONTEXT_MONITOR_SOURCE_FILE);
+
+                const mainNorm = mainRelPath.replace(/\\/g, '/');
+                const mainDir = path.posix.dirname(mainNorm);
+                contextMonitorPath = mainDir && mainDir !== '.'
+                    ? `${mainDir}/${CONTEXT_MONITOR_BASENAME}`
+                    : CONTEXT_MONITOR_BASENAME;
+
+                const cleanedMain = cleanMarkedBlock(mainSource, CTX_MONITOR_MAIN_START, CTX_MONITOR_MAIN_END).trimEnd();
+                const patchedMain = `${cleanedMain}\n${CTX_MONITOR_MAIN_START}\ntry{require('./${CONTEXT_MONITOR_BASENAME}');}catch(_e){}\n${CTX_MONITOR_MAIN_END}\n`;
+                compileCheckJs(patchedMain, mainRelPath);
+
+                const cleanedPreload = cleanMarkedBlock(
+                    filePatches[preloadCandidate.relativePath],
+                    CTX_BRIDGE_PRELOAD_START,
+                    CTX_BRIDGE_PRELOAD_END
+                ).trimEnd();
+                const patchedPreload = `${cleanedPreload}\n${buildContextBridgePreloadBlock()}\n`;
+                compileCheckJs(patchedPreload, preloadCandidate.relativePath);
+
+                filePatches[contextMonitorPath] = contextMonitorSrc;
+                filePatches[mainRelPath] = patchedMain;
+                filePatches[preloadCandidate.relativePath] = patchedPreload;
+                if (!optionalFiles.includes(mainRelPath) && mainRelPath !== menuPath) {
+                    optionalFiles.push(mainRelPath);
+                }
+            }
+        }
+    }
+
     return {
         filePatches,
         preloadPath: preloadCandidate.relativePath,
         menuPath,
         optionalFiles,
+        contextMonitorPath,
     };
 }
 
@@ -1465,7 +1586,7 @@ function installLocalization(resourcesDir, options = {}) {
 
         console.log(`[识别] 产品: ${appInfo.name}; 版本: ${appInfo.version}; 依据: ${appInfo.evidenceFile || '未知'}`);
         const backup = ensureVersionedBackup(resourcesDir, base.baseArchive, base.baseHash);
-        const { filePatches, preloadPath, menuPath, optionalFiles } = buildArchivePatches(base.baseArchive);
+        const { filePatches, preloadPath, menuPath, optionalFiles, contextMonitorPath } = buildArchivePatches(base.baseArchive, options);
 
         const metadata = {
             schemaVersion: 1,
@@ -1476,12 +1597,14 @@ function installLocalization(resourcesDir, options = {}) {
             baseHash: base.baseHash,
             backupFile: backup.backupRelativePath,
             preloadFile: preloadPath.replace(/\\/g, '/'),
+            contextMonitor: Boolean(contextMonitorPath),
         };
         filePatches[METADATA_FILE] = JSON.stringify(metadata, null, 2) + '\n';
 
         console.log(`[修改] preload: ${preloadPath}`);
         if (menuPath) console.log(`[修改] 原生菜单: ${menuPath}`);
         if (optionalFiles.length > 0) console.log(`[修改] 其他主进程界面文件: ${optionalFiles.length} 个`);
+        if (contextMonitorPath) console.log(`[修改] 上下文与速率监控: ${contextMonitorPath}`);
 
         const nonce = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
         stagedArchive = path.join(resourcesDir, `app.asar.localized-${nonce}.tmp`);
@@ -1505,6 +1628,7 @@ function installLocalization(resourcesDir, options = {}) {
             localizedHash,
             activeBackup: backup.backupRelativePath,
             migratedLegacyBackup: base.migratedLegacyBackup,
+            contextMonitor: Boolean(contextMonitorPath),
         };
         try {
             writeJsonWithRollback(getManifestPath(resourcesDir), manifest);
@@ -1517,7 +1641,13 @@ function installLocalization(resourcesDir, options = {}) {
         }
 
         console.log(`[完成] 已部署汉化引擎；官方基线 SHA-256: ${base.baseHash}`);
-        return { appInfo, baseHash: base.baseHash, localizedHash, backupPath: backup.backupPath };
+        return {
+            appInfo,
+            baseHash: base.baseHash,
+            localizedHash,
+            backupPath: backup.backupPath,
+            contextMonitor: Boolean(contextMonitorPath),
+        };
     } finally {
         if (stagedArchive && fs.existsSync(stagedArchive)) fs.unlinkSync(stagedArchive);
     }
@@ -1888,6 +2018,7 @@ function parseArguments(argv) {
         noKill: false,
         checkWrite: false,
         allowUnverifiedProduct: false,
+        contextMonitor: true,
     };
     for (let index = 0; index < argv.length; index++) {
         const argument = argv[index];
@@ -1898,6 +2029,8 @@ function parseArguments(argv) {
         else if (argument === '--no-kill') options.noKill = true;
         else if (argument === '--check-write') options.checkWrite = true;
         else if (argument === '--allow-unverified-product') options.allowUnverifiedProduct = true;
+        else if (argument === '--no-context-monitor') options.contextMonitor = false;
+        else if (argument === '--context-monitor') options.contextMonitor = true;
         else if (argument === '--brand-title') index++;
     }
     return options;

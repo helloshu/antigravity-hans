@@ -401,10 +401,19 @@ function createFakeDomEnvironment(generatedSource, options = {}) {
     const body = new FakeElement('body');
     html.append(body);
 
-    const protocol = options.protocol || 'file:';
+    const protocol = options.protocol || 'http:';
+    const hostname = options.hostname !== undefined
+        ? options.hostname
+        : ((protocol === 'http:' || protocol === 'https:') ? '127.0.0.1' : '');
+    const port = options.port !== undefined
+        ? options.port
+        : ((protocol === 'http:' || protocol === 'https:') ? '49152' : '');
+    const host = hostname ? (port ? `${hostname}:${port}` : hostname) : '';
     const location = {
         protocol,
-        href: `${protocol}//app/`
+        hostname,
+        host,
+        href: options.href || (host ? `${protocol}//${host}/` : `${protocol}//app/`)
     };
 
     const document = {
@@ -495,7 +504,7 @@ function createFakeDomEnvironment(generatedSource, options = {}) {
     const script = new vm.Script(generatedSource, { filename: 'generated-localization-injection.js' });
     script.runInContext(context);
 
-    if (activeObservers.size === 0) {
+    if (!options.expectBlockedContext && activeObservers.size === 0) {
         throw new Error('生成的注入代码没有注册 MutationObserver');
     }
 
@@ -526,10 +535,12 @@ function createFakeDomEnvironment(generatedSource, options = {}) {
         });
     }
 
-    function mount(node) {
-        body.append(node);
-        dispatchAdded(node);
-        return node;
+    function mount(...nodes) {
+        for (const node of nodes) {
+            body.append(node);
+            dispatchAdded(node);
+        }
+        return nodes.length === 1 ? nodes[0] : nodes;
     }
 
     function reset() {
@@ -552,6 +563,9 @@ function createFakeDomEnvironment(generatedSource, options = {}) {
             return new FakeElement(tagName).append(...children);
         },
         mount,
+        observerCount() {
+            return activeObservers.size;
+        },
         reset,
         text(value) {
             return new FakeTextNode(value);

@@ -1,6 +1,6 @@
 {
   "name": "antigravity-hans",
-  "version": "2.31.2",
+  "version": "2.32.1",
   "private": true,
   "description": "Antigravity 桌面客户端简体中文汉化引擎",
   "type": "commonjs",
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "verify": "node scripts/verify.js",
-    "check": "node --check localization_engine.js && node --check installer.js && node --check tests/assets_validation.test.js && node --check tests/security_hardening.test.js",
+    "check": "node --check localization_engine.js && node --check installer.js && node --check context_monitor.js && node --check tests/assets_validation.test.js && node --check tests/security_hardening.test.js",
     "test": "node tests/assets_validation.test.js && node tests/security_hardening.test.js"
   }
 }

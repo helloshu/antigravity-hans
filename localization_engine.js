@@ -58,6 +58,10 @@ const MAIN_SUBFRAME_SIGNATURE_START = "'__ANTIGRAVITY_MAIN_SUBFRAME_LOCALIZATION
 const MAIN_SUBFRAME_SIGNATURE_END = "'__ANTIGRAVITY_MAIN_SUBFRAME_LOCALIZATION_END__';";
 const UTILS_SUBFRAME_SIGNATURE_START = "'__ANTIGRAVITY_UTILS_SUBFRAME_LOCALIZATION_START__';";
 const UTILS_SUBFRAME_SIGNATURE_END = "'__ANTIGRAVITY_UTILS_SUBFRAME_LOCALIZATION_END__';";
+const CTX_MONITOR_MAIN_START = "'__AG_CTX_MONITOR_START__';";
+const CTX_MONITOR_MAIN_END = "'__AG_CTX_MONITOR_END__';";
+const CTX_BRIDGE_PRELOAD_START = "'__AG_CTX_BRIDGE_START__';";
+const CTX_BRIDGE_PRELOAD_END = "'__AG_CTX_BRIDGE_END__';";
 const LEGACY_SIGNATURE_START = ['/', '* --- ANTIGRAVITY CHINESE LOCALIZATION START --- *', '/'].join('');
 const LEGACY_SIGNATURE_END = ['/', '* --- ANTIGRAVITY CHINESE LOCALIZATION END --- *', '/'].join('');
 const LEGACY_MENU_SIGNATURE_START = ['/', '/ =========================================='].join('');
@@ -111,6 +115,23 @@ function generateJs() {
 
     const jsSource = `${SIGNATURE_START}
 (() => {
+    const isAllowedLocalizationContext = () => {
+        try {
+            const loc = globalThis.location;
+            if (!loc) return false;
+            const protocol = typeof loc.protocol === 'string' ? loc.protocol.toLowerCase() : '';
+            if (protocol === 'plugin:') return true;
+            if (protocol === 'http:' || protocol === 'https:') {
+                const host = typeof loc.hostname === 'string' ? loc.hostname.toLowerCase() : '';
+                return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1' || host.endsWith('.localhost');
+            }
+            return false;
+        } catch (e) {
+            return false;
+        }
+    };
+    if (!isAllowedLocalizationContext()) return;
+
     const map = new Map(Object.entries(DICT_PLACEHOLDER));
     const lowerMap = new Map();
     for (const [k, v] of map.entries()) lowerMap.set(k.toLowerCase(), v);
@@ -124,7 +145,7 @@ function generateJs() {
     const skillContextCache = new WeakMap();
 
     const BLOCKED_CLASSES = ['monaco-editor', 'editor-container', 'terminal', 'output-view', 'debug-console', 'code-view', 'artifact-container', 'suggest-widget'];
-    const HARD_PRUNED_CLASS_REGEX = /(?:^|\\s)(?:view-lines|view-line|view-overlays|lines-content|margin|margin-view-overlays|minimap|decorationsOverviewRuler|cursors-layer|monaco-tokenized-source|xterm|terminal|output-view|debug-console|material-symbols(?:-[a-z]+)?|material-icons(?:-[a-z]+)?|codicon(?:-[a-z]+)?|google-symbols)(?:\\s|$)/;
+    const HARD_PRUNED_CLASS_REGEX = /(?:^|\\s)(?:view-lines|view-line|view-overlays|lines-content|margin|margin-view-overlays|minimap|decorationsOverviewRuler|cursors-layer|monaco-tokenized-source|code-block|code-line|line-content|line-number|xterm|terminal|output-view|debug-console|material-symbols(?:-[a-z]+)?|material-icons(?:-[a-z]+)?|codicon(?:-[a-z]+)?|google-symbols)(?:\\s|$)/;
     const BLOCKED_TAGS = ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'INPUT', 'TEXTAREA', 'SVG', 'CANVAS', 'SYMBOL', 'PATH'];
     const BLOCKED_TAGS_SET = new Set(BLOCKED_TAGS);
     const AUTO_TRANSLATE_PROTECTED_TAGS = new Set(['CODE', 'PRE', 'INPUT', 'TEXTAREA']);
@@ -924,23 +945,6 @@ function generateJs() {
         return false;
     }
 
-    function isTimestampContext(node) {
-        if (!node) return false;
-        let curr = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-        for (let depth = 0; curr && depth < 4; depth++) {
-            if (curr === document.body || curr === document.documentElement) break;
-            const tag = curr.tagName ? curr.tagName.toUpperCase() : '';
-            if (tag === 'P' || tag === 'LI' || tag === 'PRE' || tag === 'CODE' || tag === 'BLOCKQUOTE' || tag === 'ARTICLE') return false;
-            const cls = curr.className;
-            if (typeof cls === 'string' && /(?:prose|markdown)/i.test(cls)) return false;
-            if (tag === 'TIME' || curr.hasAttribute?.('datetime')) return true;
-            const meta = [curr.className, curr.getAttribute?.('data-testid'), curr.getAttribute?.('aria-label'), curr.getAttribute?.('title')].filter(Boolean).join(' ');
-            if (/(?:^|[-_\\s])(?:time|timestamp|date|muted|secondary|caption)(?:[-_\\s]|$)|(?:^|\\s)text-xs(?:\\s|$)/i.test(meta)) return true;
-            curr = curr.parentElement;
-        }
-        return false;
-    }
-
     // 0 = unblocked, 1 = soft-blocked (user-input-step / contenteditable / monaco-editor outer),
     // 2 = hard-blocked (SKIP_TRANSLATION_ATTR / BLOCKED_TAGS / view-lines / terminal: zero subtree work)
     function getElementBlockedState(el) {
@@ -980,7 +984,7 @@ function generateJs() {
 
         const testId = el.getAttribute('data-testid');
         const prevTestId = prev ? prev.getAttribute?.('data-testid') : null;
-        if (testId === 'file-title-name' || prevTestId === 'file-title-name' || prevTestId === 'file-tree-node-icon') {
+        if (testId === 'file-title-name' || testId === 'code-gutter' || prevTestId === 'file-title-name' || prevTestId === 'file-tree-node-icon' || el.hasAttribute('data-line-tokens')) {
             blockedZoneCache.set(el, -1);
             return 2;
         }
@@ -1199,9 +1203,65 @@ function generateJs() {
         return false;
     }
 
+    function translateSideQuestionOriginPrefix(text) {
+        if (text === "Started from") return "发起自";
+        if (text === "Started during") return "进行中发起自";
+        return null;
+    }
+
+    function translateSideQuestionOriginFallbackTarget(text) {
+        if (text === "the main conversation") return "主会话";
+        if (text === "the subagent conversation") return "子智能体会话";
+        return null;
+    }
+
+    function translateSideQuestionOriginAttr(value, el) {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE || el.getAttribute?.("data-testid") !== "side-question-origin") {
+            return null;
+        }
+        const normalized = typeof value === "string" ? value.trim().replace(/\\s+/g, " ") : "";
+        if (!normalized) return null;
+
+        let match = normalized.match(/^(Started from|Started during)\\s+([\\s\\S]+?)\\.\\s+Show in (main conversation|subagent conversation)$/);
+        if (match) {
+            const prefix = translateSideQuestionOriginPrefix(match[1]);
+            const origin = translateSideQuestionOriginFallbackTarget(match[2]) || match[2];
+            const scope = match[3] === "main conversation" ? "主会话" : "子智能体会话";
+            return prefix + " " + origin + ". 在" + scope + "中显示";
+        }
+
+        match = normalized.match(/^(Started from|Started during)\\s+([\\s\\S]+)$/);
+        if (match) {
+            const prefix = translateSideQuestionOriginPrefix(match[1]);
+            const origin = translateSideQuestionOriginFallbackTarget(match[2]) || match[2];
+            return prefix + " " + origin;
+        }
+        return null;
+    }
+
+    function getSideQuestionOriginTextNodeTranslation(node, valNorm) {
+        if (!node || !valNorm) return null;
+        const parentSpan = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        if (!parentSpan || parentSpan.tagName?.toUpperCase() !== "SPAN") return null;
+        const originBtn = parentSpan.parentElement;
+        if (!originBtn || originBtn.getAttribute?.("data-testid") !== "side-question-origin") return null;
+
+        const spanClass = typeof parentSpan.className === "string" ? parentSpan.className : "";
+        if (spanClass.includes("truncate")) {
+            return translateSideQuestionOriginFallbackTarget(valNorm);
+        }
+        const prefix = translateSideQuestionOriginPrefix(valNorm);
+        if (prefix) return prefix;
+        if (valNorm === "Show") return "显示";
+        return null;
+    }
+
     function getProtectedProductUiTranslation(node, value) {
         const normalized = norm(value);
         const lower = normalized.toLowerCase();
+
+        const sideOriginTrans = getSideQuestionOriginTextNodeTranslation(node, normalized);
+        if (sideOriginTrans) return sideOriginTrans;
 
         if (isMessageActionTimestamp(node)) {
             const relativeTime = getRelativeTimeTranslation(normalized, node);
@@ -1428,30 +1488,6 @@ function generateJs() {
             if (text.length <= 6000 && /(?:Comments?|评论)\\s*[（(]\\s*\\d+\\s*[)）]/i.test(text)) return true;
             if (text.length <= 2000 && /(?:Save Comment|保存评论|Submit comment|提交评论|Add Comment|添加评论)/i.test(text)) return true;
             current = current.parentElement || (current.getRootNode?.().host ?? null);
-        }
-        return false;
-    }
-
-    function hasRelativeTimeDescendant(element) {
-        if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
-        const pending = Array.from(element.childNodes || []);
-        let count = 0;
-        while (pending.length > 0 && ++count < 40) {
-            const current = pending.pop();
-            if (current.nodeType === Node.TEXT_NODE) {
-                const text = norm(current.nodeValue);
-                if (/^(?:just\\s+now|刚刚|\\d+\\s*(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|wks?|weeks?|mos?|months?|yrs?|years?)\\s+ago|\\d+\\s*(?:s|m|h|d|w|mo|yr|y)\\s+ago|\\d+\\s*(?:秒|分钟|小时|天|周|个月|年)前)$/i.test(text) || /^\\d+\\s*(?:s|m|h|d|w|mo|yr|y)$/.test(text)) {
-                    return true;
-                }
-                continue;
-            }
-            if (current.nodeType === Node.ELEMENT_NODE) {
-                const tag = current.tagName ? current.tagName.toUpperCase() : '';
-                if (tag === 'CODE' || tag === 'PRE' || tag === 'BLOCKQUOTE' || tag === 'P' || tag === 'LI') continue;
-                const cls = typeof current.className === 'string' ? current.className : '';
-                if (/(?:prose|markdown)/i.test(cls)) continue;
-                if (current.childNodes) pending.push(...current.childNodes);
-            }
         }
         return false;
     }
@@ -2001,6 +2037,16 @@ function generateJs() {
             descriptions: [
                 "Discover UI plugin panels relevant to the current task and surface a one-click pill in chat to open (toggle) them in the side pane. Use when a running UI plugin's panel would help with what the user is doing, or right after the user enables a new UI plugin pane and a shortcut to open it is handy.",
                 "发现与当前任务相关的 UI 插件面板，并在聊天中提供一键胶囊按钮以便在侧边面板中打开（切换）它们。当运行中的 UI 插件面板对用户正在进行的操作有所帮助，或在用户启用新的 UI 插件面板且需要便捷快捷方式打开它时使用"
+            ]
+        },
+        {
+            source: 'mcp-app-development',
+            display: "MCP 应用开发",
+            descriptions: [
+                "Build, package, and debug MCP Apps for Antigravity: MCP server tools whose results render as interactive UI in the conversation, in the side pane, or full-page from the sidebar. Use when adding a UI to an MCP tool, building or theming the app itself, packaging it as a plugin, or debugging an app that doesn't render or behave as expected.",
+                "Build, package, and debug MCP Apps for Antigravity: MCP server tools whose results render as interactive UI in the conversation, in the side pane, or full-page from the sidebar.",
+                "为 Antigravity 构建、打包和调试 MCP 应用: 其结果可在对话中、侧边面板或从侧边栏以全页形式呈现为交互式界面的 MCP 服务器工具. 当向 MCP 工具添加界面、构建或设置应用主题、将其打包为插件，或调试无法按预期渲染或运行的应用时使用.",
+                "为 Antigravity 构建、打包和调试 MCP 应用：其结果可在对话中、侧边面板或从侧边栏以全页形式呈现为交互式界面的 MCP 服务器工具。当向 MCP 工具添加界面、构建或设置应用主题、将其打包为插件，或调试无法按预期渲染或运行的应用时使用"
             ]
         },
         {
@@ -2834,9 +2880,46 @@ function generateJs() {
         return match[1] + " " + translatedStatus;
     }
 
+    function getModelUnavailableRetryTranslation(value) {
+        if (!value || typeof value !== 'string') return null;
+        const valNorm = norm(value);
+        if (!/^Model\\s+unavailable,\\s*retrying\\b/i.test(valNorm)) return null;
+        const m = valNorm.match(/^Model\\s+unavailable,\\s*retrying(?:\\s+in\\s+(\\d+)s)?(?:\\s*\\(attempt\\s+(\\d+)\\/(\\d+)\\))?$/i);
+        if (!m) return null;
+        let res = m[1] ? "模型不可用，将在 " + m[1] + " 秒后重试" : "模型不可用，正在重试";
+        if (m[2] && m[3]) {
+            res += " (第 " + m[2] + "/" + m[3] + " 次尝试)";
+        }
+        return res;
+    }
+
 function getDynamicProductUiTranslation(value, node = null) {
         const normalized = norm(value);
-        let match = normalized.match(/^Hi\\s+(.+?),\\s+what can we get done today\\?$/i);
+        const sideOriginAttrTrans = translateSideQuestionOriginAttr(value, node);
+        if (sideOriginAttrTrans) return sideOriginAttrTrans;
+        const sideOriginTextTrans = getSideQuestionOriginTextNodeTranslation(node, normalized);
+        if (sideOriginTextTrans) return sideOriginTextTrans;
+        const retryTrans = getModelUnavailableRetryTranslation(normalized);
+        if (retryTrans) return retryTrans;
+
+        let match = normalized.match(/^(.+?)\\s+needs?\\s+the\\s+terminal\\s+sandbox,\\s*which\\s+isn't\\s+available\\s+on\\s+this\\s+host\\.$/i);
+        if (match && match[1].length <= 80) {
+            const modeMap = {
+                "request review": "请求审查",
+                "default": "默认",
+                "auto": "自动",
+                "turbo": "极速"
+            };
+            const parts = match[1].split(/\\s+and\\s+/i).map(p => modeMap[p.trim().toLowerCase()] || p.trim());
+            return parts.join(" 和 ") + " 需要终端沙箱，但此主机上不可用.";
+        }
+
+        match = normalized.match(/^Sign-ins\\s+to\\s+(.+?)\\s+are\\s+kept\\s+in\\s+the\\s+cloud\\s+with\\s+your\\s+account\\.$/i);
+        if (match && match[1].length <= 160) {
+            return "登录到 " + match[1] + " 的凭据将随您的账号保存在云端.";
+        }
+
+        match = normalized.match(/^Hi\\s+(.+?),\\s+what can we get done today\\?$/i);
         if (match) return "嗨 " + match[1] + "，今天我们可以完成些什么？";
 
         match = normalized.match(/^Your\\s+Plan:\\s*(.+)$/i);
@@ -2990,8 +3073,39 @@ function getDynamicProductUiTranslation(value, node = null) {
         if (match) return "例如 " + match[1];
 
         match = normalized.match(/^Uses\\s+your\\s+local\\s+clone,\\s*(.+)$/i);
-        if (match) return "使用您的本地克隆，" + match[1];
-        if (/^Uses\\s+your\\s+local\\s+clone,?$/i.test(normalized)) return "使用您的本地克隆，";
+        if (match && match[1].length <= 160 && (!node || !isContentBodyContainer(node))) {
+            return "使用您的本地克隆，" + match[1];
+        }
+        if (/^Uses\\s+your\\s+local\\s+clone,?$/i.test(normalized) && (!node || !isContentBodyContainer(node))) {
+            return "使用您的本地克隆，";
+        }
+
+        match = normalized.match(/^Connecting\\s+to\\s+(.+?)(?:\\.\\.\\.|…)$/i);
+        if (match) return "正在连接至 " + match[1] + "…";
+
+        match = normalized.match(/^Couldn't\\s+connect\\s+to\\s+(.+)$/i);
+        if (match) return "无法连接至 " + match[1];
+
+        match = normalized.match(/^SSH\\s+Config\\s*\\((.+?)\\)$/i);
+        if (match) return "SSH 配置 (" + match[1] + ")";
+
+        match = normalized.match(/^(\\d+)\\s+hidden\\s+hosts?$/i);
+        if (match) return match[1] + " 个隐藏主机";
+
+        match = normalized.match(/^No\\s+hosts\\s+in\\s+(.+?)\\s+yet\\.\\s+Type\\s+one\\s+above\\.$/i);
+        if (match) return match[1] + " 中暂无主机. 请在上方输入.";
+
+        match = normalized.match(/^Remove\\s+(.+?)\\s+from\\s+Recent$/i);
+        if (match) return "从最近记录中移除 " + match[1];
+
+        match = normalized.match(/^Hide\\s+(.+?)\\s+from\\s+this\\s+list$/i);
+        if (match) return "从此列表中隐藏 " + match[1];
+
+        match = normalized.match(/^Show\\s+(.+?)\\s+in\\s+the\\s+list\\s+again$/i);
+        if (match) return "在列表中重新显示 " + match[1];
+
+        match = normalized.match(/^Move\\s+to\\s+Group:\\s*(.+)$/i);
+        if (match) return "移动到分组: " + match[1];
 
         if (/^Your\\s+Antigravity\\s+use\\s+will\\s+be\\s+associated\\s+with\\s+provided\\s+project\\.?\\s*Make\\s+sure\\s+you\\s+trust\\s+the\\s+project\\s+ID\\s+before\\s+proceeding\\.?\\s*Account\\s+activity\\s+and\\s+data\\s+may\\s+be\\s+logged\\s+by\\s+your\\s+organization\\.?$/i.test(normalized)) {
             return "您对 Antigravity 的使用将与所提供的项目相关联. 在继续之前，请确保您信任该项目 ID. 您的组织可能会记录账号活动和数据.";
@@ -3611,54 +3725,6 @@ function getDynamicProductUiTranslation(value, node = null) {
                             return changed;
                         }
                     }
-                }
-            }
-            current = current.parentElement || (current.parentNode && current.parentNode.host);
-        }
-        return false;
-    }
-
-    function translateBrowserSubagentNotice(element) {
-        if (!element) return false;
-
-        let current = element.nodeType === Node.TEXT_NODE ? element.parentElement : element;
-        for (let depth = 0; current && depth < 6; depth++) {
-            if (current === document.body || current === document.documentElement) break;
-            if (current.nodeType === Node.ELEMENT_NODE && !isInBlockedZone(current)) {
-                const cText = getBoundedTextContent(current, 24, 500);
-                if (cText === null) break;
-                if (cText.length <= 500 &&
-                    /(?:Configure the browser subagent|Configure allowed and denied URLs for the browser subagent|配置浏览器子智能体|配置允许和禁止浏览器子智能体)/i.test(cText) &&
-                    /(?:Google Chrome|to be installed)/i.test(cText)) {
-                    const textNodes = collectTextNodes(current).filter(tn => !isInBlockedZone(tn));
-                    if (textNodes.length === 0) return false;
-
-                    let changed = false;
-                    for (let i = 0; i < textNodes.length; i++) {
-                        const tn = textNodes[i];
-                        const val = tn.nodeValue || '';
-                        const valN = norm(val);
-
-                        if (/^Configure the browser subagent\\.\\s*It requires$/i.test(valN)) {
-                            changed = replaceTextNode(tn, "配置浏览器子智能体. 它需要安装 ") || changed;
-                        } else if (/^Configure allowed and denied URLs for the browser subagent\\s*\\(invoked with \\/browser\\)\\.\\s*Requires$/i.test(valN)) {
-                            changed = replaceTextNode(tn, "配置允许和禁止浏览器子智能体(通过 /browser 调用)访问的 URL. 需要 ") || changed;
-                        } else if (/^Configure allowed and denied URLs for the browser subagent\\s*\\(invoked with$/i.test(valN)) {
-                            changed = replaceTextNode(tn, "配置允许和禁止浏览器子智能体(通过 ") || changed;
-                        } else if (/^\\)\\.\\s*Requires$/i.test(valN)) {
-                            changed = replaceTextNode(tn, ") 调用)访问的 URL. 需要 ") || changed;
-                        } else if (/^to be installed\\.?$/i.test(valN)) {
-                            changed = replaceTextNode(tn, ". ") || changed;
-                        } else if (/^to be installed\\.\\s*(.+)$/i.test(valN)) {
-                            const match = valN.match(/^to be installed\\.\\s*(.+)$/i);
-                            const rest = match[1];
-                            const restTrans = map.get(norm(rest)) || lowerMap.get(norm(rest).toLowerCase()) || rest;
-                            changed = replaceTextNode(tn, ". " + restTrans) || changed;
-                        } else if (/^The browser subagent can be invoked by typing \\/browser in the conversation input box\\.?$/i.test(valN)) {
-                            changed = replaceTextNode(tn, "您可以通过在会话输入框中输入 /browser 来调用浏览器子智能体.") || changed;
-                        }
-                    }
-                    if (changed) return true;
                 }
             }
             current = current.parentElement || (current.parentNode && current.parentNode.host);
@@ -4552,7 +4618,7 @@ function getDynamicProductUiTranslation(value, node = null) {
         return changed;
     }
 
-    const SKILL_PICKER_CONTAINER_REGEX = /(?:quick question without interrupting|align on a plan|team of agents to autonomously|recent successes or corrections|Boost multi-agent orchestrator|Antigravity Customization System|comprehensive guide, quick reference, and sitemap|render rich interactive HTML widgets|scheduled background automation|manage and create plugins|namespaced bundles of skills|MCP servers, skills, slash commands|other coding agents|manage Google Docs|draft, and edit docs|and write your Google Docs|schedule events, and RSVP|draft, and send emails in Gmail|Run your Gmail inbox|manage Gmail messages, drafts, labels|format spreadsheets|edit, and export presentations|upload, download, and share files|Preview & Quota Heavy\\) Run a swarm|several agents working in parallel|native-swarm worker whose brief says it is the monitor|不中断主会话|通过访谈与我对齐|智能体团队自主应对|反思最近的成功或改进|Boost 多智能体编排器|个性化定制系统的综合指南|全面指南、快速参考和网站地图|交互式 HTML 小组件|定时后台自动化|计划后台自动化|管理和创建插件|迁移到一个新的 Antigravity 插件中|管理 Google 文档|起草和编辑文档|安排活动并回复邀请|在 Gmail 中搜索、阅读、起草并发送电子邮件|管理您的 Gmail 收件箱|管理 Gmail 邮件、草稿、标签|编写和格式化电子表格|导出演示文稿|上传、下载和共享文件|运行蜂群协作|指定为监控员的原生蜂群)/i;
+    const SKILL_PICKER_CONTAINER_REGEX = /(?:quick question without interrupting|align on a plan|team of agents to autonomously|recent successes or corrections|Boost multi-agent orchestrator|Antigravity Customization System|comprehensive guide, quick reference, and sitemap|render rich interactive HTML widgets|scheduled background automation|manage and create plugins|namespaced bundles of skills|MCP servers, skills, slash commands|other coding agents|Build, package, and debug MCP Apps|manage Google Docs|draft, and edit docs|and write your Google Docs|schedule events, and RSVP|draft, and send emails in Gmail|Run your Gmail inbox|manage Gmail messages, drafts, labels|format spreadsheets|edit, and export presentations|upload, download, and share files|Preview & Quota Heavy\\) Run a swarm|several agents working in parallel|native-swarm worker whose brief says it is the monitor|不中断主会话|通过访谈与我对齐|智能体团队自主应对|反思最近的成功或改进|Boost 多智能体编排器|个性化定制系统的综合指南|全面指南、快速参考和网站地图|交互式 HTML 小组件|定时后台自动化|计划后台自动化|管理和创建插件|迁移到一个新的 Antigravity 插件中|构建、打包和调试 MCP 应用|管理 Google 文档|起草和编辑文档|安排活动并回复邀请|在 Gmail 中搜索、阅读、起草并发送电子邮件|管理您的 Gmail 收件箱|管理 Gmail 邮件、草稿、标签|编写和格式化电子表格|导出演示文稿|上传、下载和共享文件|运行蜂群协作|指定为监控员的原生蜂群)/i;
 
     function translateSwarmBoardEmptyBody(element) {
         if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
@@ -5283,6 +5349,30 @@ function getDynamicProductUiTranslation(value, node = null) {
             return false;
         }
 
+        if (element.getAttribute?.("data-testid") === "side-question-origin") {
+            for (const attr of ["title", "aria-label"]) {
+                const v = element.getAttribute(attr);
+                if (!v) continue;
+                const transAttr = translateSideQuestionOriginAttr(v, element);
+                if (transAttr && transAttr !== v) {
+                    element.setAttribute(attr, transAttr);
+                }
+            }
+            const spans = Array.from(element.children || []).filter(ch => ch.tagName?.toUpperCase() === "SPAN");
+            for (const span of spans) {
+                for (const child of Array.from(span.childNodes || [])) {
+                    if (child.nodeType !== Node.TEXT_NODE) continue;
+                    const textVal = norm(child.nodeValue || "");
+                    if (!textVal) continue;
+                    const trans = getSideQuestionOriginTextNodeTranslation(child, textVal);
+                    if (trans) {
+                        replaceTextNode(child, trans);
+                    }
+                }
+            }
+            return "skip_children";
+        }
+
         const rawText = getBoundedTextContent(element, 36, 1600);
         if (rawText === null) return false;
         const textLength = rawText.length;
@@ -5388,11 +5478,6 @@ function getDynamicProductUiTranslation(value, node = null) {
             /(?:This will archive|这将归档)/i.test(rawText) &&
             /(?:conversations?|chats?|会话|within it)/i.test(rawText)) {
             translated = translateArchiveNotice(element) || translated;
-        }
-        if (textLength <= 500 &&
-            /(?:Configure the browser subagent|Configure allowed and denied URLs for the browser subagent|配置浏览器子智能体|配置允许和禁止浏览器子智能体)/i.test(rawText) &&
-            /(?:Google Chrome|to be installed)/i.test(rawText)) {
-            translated = translateBrowserSubagentNotice(element) || translated;
         }
         if (element.getAttribute?.('data-testid') === 'plan-command-fyi-alert' ||
             (textLength <= 250 && /(?:Type|类型|键入)\\s*\\/\\s*(?:and\\s+select|并选择)\\s*plan/i.test(rawText))) {
@@ -5621,18 +5706,6 @@ function getDynamicProductUiTranslation(value, node = null) {
             }
         }
 
-        if (/^Configure allowed and denied URLs for the browser subagent\\s*\\(invoked with \\/browser\\)\\.\\s*Requires$/i.test(currentText)) {
-            const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 500) || '') : '';
-            if (/Google Chrome/i.test(parentText)) {
-                return "配置允许和禁止浏览器子智能体(通过 /browser 调用)访问的 URL. 需要 ";
-            }
-        }
-        if (/^to be installed\\.?$/i.test(currentText)) {
-            const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 500) || '') : '';
-            if (/^Google Chrome$/i.test(getPrevText()) || /(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
-                return ". ";
-            }
-        }
         if (/^to ask for content changes for legal reasons[.。]?$/i.test(currentText)) {
             const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 400) || '') : '';
             if (/^(?:Legal Help|法律帮助)$/i.test(getPrevText()) || /(?:Legal Help|法律帮助)/i.test(parentText)) {
@@ -5658,15 +5731,6 @@ function getDynamicProductUiTranslation(value, node = null) {
             const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 500) || '') : '';
             if (/(?:third party developer tools|第三方开发者工具)/i.test(parentText)) {
                 return "Google 将根据 ";
-            }
-        }
-        const toBeInstalledMatch = currentText.match(/^to be installed\\.\\s*(.+)$/i);
-        if (toBeInstalledMatch) {
-            const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 500) || '') : '';
-            if (/^Google Chrome$/i.test(getPrevText()) || /(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
-                const rest = toBeInstalledMatch[1];
-                const restTrans = map.get(norm(rest)) || lowerMap.get(norm(rest).toLowerCase()) || rest;
-                return ". " + restTrans;
             }
         }
 
@@ -6155,6 +6219,63 @@ function getDynamicProductUiTranslation(value, node = null) {
         } catch (e) {}
     }
 
+    function isPureThoughtSkipContext(el) {
+        let curr = el;
+        let sawThoughtSkip = false;
+        for (let depth = 0; curr && depth < 12; depth++) {
+            if (curr === document.body || curr === document.documentElement) break;
+            const tag = curr.tagName ? curr.tagName.toUpperCase() : '';
+            if (tag && BLOCKED_TAGS_SET.has(tag)) return false;
+            const cls = typeof curr.className === 'string' ? curr.className : '';
+            if (cls && HARD_PRUNED_CLASS_REGEX.test(cls)) return false;
+            if (curr.getAttribute?.('contenteditable') === 'true') return false;
+            const testId = curr.getAttribute?.('data-testid');
+            if (testId === 'user-input-step') return false;
+            if (curr.hasAttribute?.(SKIP_TRANSLATION_ATTR)) {
+                sawThoughtSkip = true;
+            }
+            const prev = curr.previousElementSibling;
+            if (prev && prev.hasAttribute?.('data-ag-thought-header') && curr.parentElement && curr.parentElement.children.length === 2) {
+                sawThoughtSkip = true;
+            }
+            curr = curr.parentElement;
+        }
+        return sawThoughtSkip;
+    }
+
+    function translateModelRetryInsideThought(el) {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+        const bounded = getBoundedTextContent(el, 8, 120);
+        if (bounded && /Model\\s+unavailable,\\s*retrying\\b/i.test(bounded)) {
+            const queue = [el];
+            for (let qi = 0; qi < queue.length && qi < 12; qi++) {
+                const item = queue[qi];
+                for (const child of item.childNodes) {
+                    if (child.nodeType === Node.TEXT_NODE) {
+                        const tv = child.nodeValue || '';
+                        const retryTrans = getModelUnavailableRetryTranslation(tv);
+                        if (retryTrans && retryTrans !== tv) {
+                            replaceTextNode(child, retryTrans);
+                            return true;
+                        }
+                    } else if (child.nodeType === Node.ELEMENT_NODE && !BLOCKED_TAGS_SET.has((child.tagName || '').toUpperCase())) {
+                        queue.push(child);
+                    }
+                }
+            }
+            return false;
+        }
+        let tail = el.lastElementChild;
+        for (let d = 0; tail && d < 4; d++) {
+            const tailText = getBoundedTextContent(tail, 6, 120);
+            if (tailText && /Model\\s+unavailable,\\s*retrying\\b/i.test(tailText)) {
+                return translateModelRetryInsideThought(tail);
+            }
+            tail = tail.lastElementChild;
+        }
+        return false;
+    }
+
     function translateNode(node, parentContainersScanned = false, visitedElements = null) {
         try {
             if (!node) return;
@@ -6169,18 +6290,26 @@ function getDynamicProductUiTranslation(value, node = null) {
                     if (visitedElements.has(node)) return;
                     visitedElements.add(node);
                 }
-                if (node.hasAttribute(SKIP_TRANSLATION_ATTR)) return;
+                if (node.hasAttribute(SKIP_TRANSLATION_ATTR)) {
+                    if (isPureThoughtSkipContext(node)) {
+                        translateModelRetryInsideThought(node);
+                    }
+                    return;
+                }
                 const prev = node.previousElementSibling;
                 if (prev && prev.hasAttribute('data-ag-thought-header') && node.parentElement && node.parentElement.children.length === 2) {
                     node.setAttribute(SKIP_TRANSLATION_ATTR, 'true');
                     blockedZoneCache.set(node, -1);
+                    if (isPureThoughtSkipContext(node)) {
+                        translateModelRetryInsideThought(node);
+                    }
                     return;
                 }
 
                 const tag = node.tagName.toUpperCase();
                 const className = typeof node.className === 'string' ? node.className : '';
 
-                if (className && HARD_PRUNED_CLASS_REGEX.test(className)) {
+                if ((className && HARD_PRUNED_CLASS_REGEX.test(className)) || node.hasAttribute('data-line-tokens') || node.getAttribute('data-testid') === 'code-gutter') {
                     if (node.getAttribute('translate') !== 'no') node.setAttribute('translate', 'no');
                     try {
                         if (!node.classList.contains('notranslate')) node.classList.add('notranslate');
@@ -6261,7 +6390,12 @@ function getDynamicProductUiTranslation(value, node = null) {
                 }
 
                 const blockedState = getElementBlockedState(node);
-                if (blockedState === 2) return;
+                if (blockedState === 2) {
+                    if (isPureThoughtSkipContext(node)) {
+                        translateModelRetryInsideThought(node);
+                    }
+                    return;
+                }
 
                 if (isSwarmBoardDocument()) {
                     if (translateSwarmBoardContainers(node) === 'skip_children') return;
@@ -6324,7 +6458,15 @@ function getDynamicProductUiTranslation(value, node = null) {
 
                 const parentEl = node.parentElement;
                 const parentBlockedState = getElementBlockedState(parentEl);
-                if (parentBlockedState === 2) return;
+                if (parentBlockedState === 2) {
+                    if (originalVal.length <= 96 && /^\\s*Model\\s+unavailable,\\s*retrying\\b/i.test(originalVal) && isPureThoughtSkipContext(parentEl)) {
+                        const retryTrans = getModelUnavailableRetryTranslation(originalVal);
+                        if (retryTrans && retryTrans !== originalVal) {
+                            replaceTextNode(node, retryTrans);
+                        }
+                    }
+                    return;
+                }
 
                 if (originalVal.length >= 9 && (originalVal.includes('pack.info') || originalVal.includes('PACK.INFO') || originalVal.toLowerCase().includes('pack.info'))) {
                     if (parentEl) {
@@ -6695,7 +6837,7 @@ function getDynamicProductUiTranslation(value, node = null) {
                     } else if (/^Asked\\s+(\\d+)\\s+questions?$/i.test(valNorm)) {
                         newVal = valNorm.replace(/^Asked\\s+(\\d+)\\s+questions?$/i, (match, num) => "已询问 " + num + " 个问题");
                     }
-                } else if (/^(?:This will (?:permanently delete|archive)|Permanently delete |Are you sure you want to delete |to be installed)|(?:within it[.。]?)$/i.test(valNorm)) {
+                } else if (/^(?:This will (?:permanently delete|archive)|Permanently delete |Are you sure you want to delete )|(?:within it[.。]?)$/i.test(valNorm)) {
                     if (/^This will permanently delete (\\d+) active (?:conversations?|chats?)(?: and (\\d+) archived (?:conversations?|chats?))? within it\\.?$/i.test(valNorm)) {
                         newVal = valNorm.replace(/^This will permanently delete (\\d+) active (?:conversations?|chats?)(?: and (\\d+) archived (?:conversations?|chats?))? within it\\.?$/i, (match, active, archived) => {
                             if (archived) {
@@ -6727,19 +6869,6 @@ function getDynamicProductUiTranslation(value, node = null) {
                         }
                     } else if (/^This will archive$/i.test(valNorm)) {
                         newVal = "这将归档其中的 ";
-                    } else if (/^to be installed\\.?$/i.test(valNorm)) {
-                        const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 500) || '') : '';
-                        if (/(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
-                            newVal = '. ';
-                        }
-                    } else if (/^to be installed\\.\\s*(.+)$/i.test(valNorm)) {
-                        const parentText = node && node.parentElement ? (getBoundedTextContent(node.parentElement, 16, 500) || '') : '';
-                        if (/(?:browser subagent|浏览器子智能体|Google Chrome)/i.test(parentText)) {
-                            const match = valNorm.match(/^to be installed\\.\\s*(.+)$/i);
-                            const rest = match[1];
-                            const restTrans = map.get(norm(rest)) || lowerMap.get(norm(rest).toLowerCase()) || rest;
-                            newVal = '. ' + restTrans;
-                        }
                     } else if (/^Are you sure you want to delete (?:the |this )?(project|workspace|项目|工作区) (.+?)\\??$/i.test(valNorm)) {
                         newVal = valNorm.replace(/^Are you sure you want to delete (?:the |this )?(project|workspace|项目|工作区) (.+?)\\??$/i, (match, scope, name) => {
                             const scopeLabel = /^(?:workspace|工作区)$/i.test(scope) ? "工作区" : "项目";
@@ -6945,16 +7074,23 @@ function getDynamicProductUiTranslation(value, node = null) {
         "Select All": "全选",
         "Close Tab": "关闭标签页",
         "Close Other Tabs": "关闭其他标签页",
+        "Close Tabs to the Left": "关闭左侧标签页",
         "Close Tabs to the Right": "关闭右侧标签页",
+        "Pin Tab": "置顶标签页",
+        "Unpin Tab": "取消置顶标签页",
+        "Keep Open": "保持打开",
         "Back": "后退",
         "Forward": "前进",
         "Reload": "重新加载",
         "Open in External Browser": "在外部浏览器中打开",
         "Open in Built-in Browser": "在内置浏览器中打开",
         "Open in Browser": "在浏览器中打开",
+        "Open in Side Panel": "在侧边面板中打开",
         "Open in": "打开方式",
         "Open In": "打开方式",
         "Built-in Browser (Default)": "内置浏览器 (默认)",
+        "Side Panel (Default)": "侧边面板 (默认)",
+        "Side Panel": "侧边面板",
         "External Browser": "外部浏览器",
         "Settings": "设置",
         "Copy Message": "复制消息",
@@ -6963,6 +7099,19 @@ function getDynamicProductUiTranslation(value, node = null) {
         "Reopen Closed Tab": "重新打开关闭的标签页",
         "Move Conversation Up": "向上移动会话",
         "Move Conversation Down": "向下移动会话",
+        "Move to Group": "移动到分组",
+        "New Group": "新建分组",
+        "Remove from Group": "从分组中移除",
+        "Restore": "恢复",
+        "Delete Permanently": "彻底删除",
+        "View Debug": "查看调试信息",
+        "Share": "分享",
+        "Telemetry": "遥测数据",
+        "Fork": "复刻",
+        "Fork in Current Workspace": "在当前工作区中复刻",
+        "Fork in Shared Workspace": "在共享工作区中复刻",
+        "Fork in New Workspace": "在新工作区中复刻",
+        "Fork conversation in this folder": "在此文件夹中复刻会话",
         "Background Commands": "后台命令",
         "Background Tasks": "后台任务"
     };
@@ -7070,5 +7219,9 @@ if (require.main === module) {
         MAIN_SUBFRAME_SIGNATURE_END,
         UTILS_SUBFRAME_SIGNATURE_START,
         UTILS_SUBFRAME_SIGNATURE_END,
+        CTX_MONITOR_MAIN_START,
+        CTX_MONITOR_MAIN_END,
+        CTX_BRIDGE_PRELOAD_START,
+        CTX_BRIDGE_PRELOAD_END,
     };
 }

@@ -1,11 +1,11 @@
 # Antigravity 桌面客户端简体中文汉化引擎
 
-- **汉化版本**：v2.31.2
-- **匹配版本**：Antigravity v2.31.2
+- **汉化版本**：v2.32.1
+- **匹配版本**：Antigravity v2.32.1
 - **支持平台**：Windows / macOS / Linux
 - **环境要求**：Node.js 18+（零第三方依赖，无需 `npm install`）
 
-基于纯 Node.js 原生二进制流修补（`AsarArchive`）的简体中文汉化引擎。采用零外部依赖、`shell: false` 参数数组调用、语法预编译校验（`vm.Script`）、SHA-256 版本化备份与同卷 `fsync` + `renameSync` 原子替换，支持秒级汉化与无损还原；自动隔离用户消息、思考流、代码编辑器与终端输出。
+基于纯 Node.js 原生二进制流修补（`AsarArchive`）的简体中文汉化引擎。采用零外部依赖、`shell: false` 参数数组调用、语法预编译校验（`vm.Script`）、SHA-256 版本化备份与同卷 `fsync` + `renameSync` 原子替换，支持秒级汉化与无损还原；自动隔离外部网页源、用户消息、思考流、代码预览/编辑器与终端输出，并内置上下文窗口占用圆环与流式生成速率（`t/s`）监控组件。
 
 ## 快速开始
 
@@ -25,6 +25,7 @@ cd antigravity-hans
 支持参数：
 - `--install-dir "/path/to/Antigravity"`：手动指定客户端安装目录
 - `--brand-title english|hidden|translated`：设置左上角品牌标题显示模式
+- `--no-context-monitor`：仅安装中文汉化，不启用输入框工具栏上下文占用与生成速率监控
 - `--no-kill`：跳过自动关闭与重启正在运行的客户端进程
 
 ### 3. 卸载还原
@@ -39,6 +40,7 @@ cd antigravity-hans
 
 - `installer.js`：零依赖安装与还原核心（v3.1.0），内置 `AsarArchive` 二进制校验与流式修补、产品身份识别、preload 动态评分定位、`plugin://` 扩展子框架隔离注入（`subframeLocalizationPreload.js`）、SHA-256 版本化备份与原子替换。
 - `localization_engine.js`：渲染层翻译注入代码生成器（`generateJs()`），命令行直接调用时自动委托 `installer.js`。
+- `context_monitor.js`：本地 Hub 窗口上下文窗口进度圆环、流式输出速率胶囊与分项 Token 明细浮层组件（仅对本地 `127.0.0.1` / `localhost` 顶层 Hub 视图生效，自动排除 SSH 远程窗口与辅助拦截层）。
 - `dicts/`：模块化翻译词典目录，主版本词典固定为 `dicts/release.json`（`release.json`），分包词典包括 `common.json`、`marketplace_plugins.json`、`menu_nav.json`、`page_agents.json`、`page_mcp_knowledge.json`、`page_settings.json`、`page_workspaces.json`。
 - `scripts/verify.js`：非安装式全量词典审计与安全契约验证入口。
 - `tests/`：词典产物、渲染层 DOM 契约与合成 ASAR 安全加固测试。

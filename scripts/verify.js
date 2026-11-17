@@ -90,6 +90,7 @@ function verifyEngineSyntax() {
     const jsFiles = [
         'localization_engine.js',
         'installer.js',
+        'context_monitor.js',
         'scripts/verify.js',
         'scripts/lib/dictionary-audit.js',
         'scripts/lib/fake-dom.js',
